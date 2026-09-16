@@ -1,0 +1,7 @@
+# Dépôts versionnés à part (forks et clone amont)
+/X-AnyLabeling/
+/X-AnyLabeling-Server/
+/sam3-official/
+
+__pycache__/
+*.pt

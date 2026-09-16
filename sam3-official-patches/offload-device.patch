@@ -1,0 +1,27 @@
+diff --git a/sam3/model/video_tracking_multiplex.py b/sam3/model/video_tracking_multiplex.py
+index 8de125a..fda57a6 100644
+--- a/sam3/model/video_tracking_multiplex.py
++++ b/sam3/model/video_tracking_multiplex.py
+@@ -2816,7 +2816,9 @@ def _append(
+     # pyre-fixme[26]: TypedDict key must be a string literal.
+     # pyre-fixme[6]: For 1st argument expected `Union[List[Tensor], tuple[Tensor,
+     #  ...]]` but got `List[Union[Set[int], Tensor]]`.
+-    d1[k1] = torch.cat([d1[k1], d2[k2]], dim=dim)
++    # Patch local (2026-09-01) : meme cecite au device que _merge ci-dessous,
++    # ce cat casse des que l'etat de tracking est deleste en RAM.
++    d1[k1] = torch.cat([d1[k1], d2[k2].to(d1[k1].device)], dim=dim)
+ 
+ 
+ def _merge(
+@@ -2835,7 +2837,10 @@ def _merge(
+     # pyre-fixme[16]: `set` has no attribute `__setitem__`.
+     # pyre-fixme[26]: TypedDict key must be a string literal.
+     # pyre-fixme[16]: `set` has no attribute `dtype`.
+-    d1[k1][d2_idx] = d2[k2].to(dtype=d1[k1].dtype)
++    # Patch local (2026-09-01) : l'amont ne convertit que le dtype, donc
++    # ce merge casse des que l'etat de tracking est deleste en RAM
++    # (offload_state_to_cpu). On aligne aussi le device sur la destination.
++    d1[k1][d2_idx] = d2[k2].to(device=d1[k1].device, dtype=d1[k1].dtype)
+ 
+ 
+ class VideoTrackingDynamicMultiplex(VideoTrackingMultiplex):
