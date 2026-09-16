@@ -556,6 +556,43 @@ Descriptions données au modèle : `MILITAIRES` et `CIVILS` en tête de `mesure-
 (sources defense.gouv.fr et Wikipédia pour VT4 et Masstech T4). Sorties brutes dans
 `runs/vlm/` (hors git).
 
+## Pistes pour la classe fine — le tracker mesuré sur UAVDT, 2026-09-16
+
+Flux visé : frames à 30 fps, SAM 3 frame par frame en classes grossières
+(`vehicle`, `person`), association des `group_id`, puis **une classe fine choisie par
+piste** (proposée par le VLM, validée par l'humain). Tout repose sur la **pureté** des
+pistes : une piste coupée en deux coûte un clic, une piste qui mélange deux objets donne
+une classe fausse à une partie de ses frames sans que rien ne le signale.
+
+`mesure-tracker.py` donne à `group_id_association.py` les boîtes de vérité terrain
+d'UAVDT **sans leur identité** (`Datasets/opensource/raw/UAVDT`, format Supervisely,
+tag `target id`, véhicules vus de drone, 30 fps, 1024×540, ~19 px médian), à la cadence
+voulue, éventuellement dégradées (`--drop` détections retirées au hasard, `--jitter`
+bruit en fraction de la taille). Réglage sur 10 séquences `train`, résultats sur 10
+séquences `test`. Pureté = part des détections d'une piste appartenant à son objet
+majoritaire.
+
+| test, 30 fps | pureté | morceaux / objet | objets d'un seul tenant |
+|---|---|---|---|
+| boîtes parfaites, réglage par défaut | 0,955 | 1,04 | 96 % |
+| 20 % de détections perdues, défaut | **0,684** | 2,62 | 41 % |
+| 20 % perdues, `buffer2=0.3 max_dist=1.0 max_age=10` | 0,801 | 1,60 | 70 % |
+| 20 % perdues + bruit 10 %, resserré | 0,703 | 1,95 | 55 % |
+
+1. **Le 30 fps est justifié.** Boîtes parfaites : pureté 0,955 à 30 fps, 0,91 à 10 fps,
+   0,88 à 5 fps, **0,77 à 1 fps** — la cadence des annotations actuelles de Campagne_1.
+2. **Le tracker s'effondre dès que des détections manquent.** Mécanisme vu sur M0208 :
+   quand un objet n'est plus détecté, sa piste continue sur sa lancée et **capte le
+   voisin** (une piste : 55 détections de l'objet 9 puis 33 de l'objet 3). La passe 2 est
+   trop permissive pour des véhicules denses : tampon 1,0, IoU > 0, centres jusqu'à
+   3,75 diagonales (~70 px pour 19 px d'objet). Elle a été réglée sur des piétons épars.
+3. **Resserrer la passe 2 aide sans rien casser** (0,684 → 0,801, 2,62 → 1,60 morceaux)
+   mais ne suffit pas : sans apparence, deux véhicules voisins restent interchangeables.
+   Le recollement des fragments n'y est pour rien (`--no-merge` : mêmes chiffres).
+4. **Réserve** : les pertes simulées sont indépendantes d'une frame à l'autre ; celles de
+   SAM 3 sont corrélées (un petit objet manqué plusieurs frames d'affilée). La mesure qui
+   tranche passe par de vraies détections SAM 3 sur UAVDT.
+
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
 Crête VRAM de propagation SAM 3.1 ~= `4,2 + 0,65 x detector_batch_size` Go.
