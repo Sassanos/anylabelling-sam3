@@ -591,7 +591,68 @@ majoritaire.
    Le recollement des fragments n'y est pour rien (`--no-merge` : mêmes chiffres).
 4. **Réserve** : les pertes simulées sont indépendantes d'une frame à l'autre ; celles de
    SAM 3 sont corrélées (un petit objet manqué plusieurs frames d'affilée). La mesure qui
-   tranche passe par de vraies détections SAM 3 sur UAVDT.
+   tranche passe par de vraies détections SAM 3 sur UAVDT — faite, ci-dessous.
+
+### Comparaison avec des trackers établis (boxmot) — vraies détections SAM 3
+
+`boxmot` 25.0.0 est installé dans un venv à part, **`.venv-tracking/`** (hors git) : il
+tirait torch cu130, que le pilote (CUDA 12.9) refuse — torch cu128 réinstallé par-dessus
+avec `--no-deps`. La ReID de BoT-SORT échoue sur GPU (`CUDNN_STATUS_NOT_INITIALIZED`,
+cuDNN mal apparié dans ce venv) : elle tourne sur CPU. `mesure-tracker.py` charge
+`group_id_association.py` par chemin, donc tourne dans les deux venvs.
+**Licence boxmot : AGPL-3.0** — à regarder avant tout déploiement en service.
+
+**Vérité terrain dégradée, 10 séquences test, 30 fps, 20 % de pertes** :
+
+| tracker | pureté | morceaux / objet | couverture |
+|---|---|---|---|
+| maison | 0,684 | 2,62 | 1,000 |
+| ByteTrack | **0,987** | 1,22 | 0,993 |
+| OC-SORT | 0,992 | 1,23 | 0,633 (jette un tiers des détections) |
+
+**Vraies détections SAM 3** (`detecte-uavdt.py`, prompt `vehicle`, conf 0,15 gardée, seuil
+rejoué hors ligne ; M0801 basse altitude, M0601 haute altitude, M0403 dense ; 1 184 frames,
+~410 ms/frame). Moyenne pondérée, seuil de score 0,5 :
+
+| tracker | pureté | morceaux / objet | objets d'un seul tenant | coût (CPU) |
+|---|---|---|---|---|
+| maison, défaut | 0,885 | 1,52 | 75 % | 2 ms/frame |
+| maison, `buffer2=0.3 max_dist=1.0 max_age=10` | 0,939 | 1,28 | 82 % | 2 ms/frame |
+| ByteTrack | 0,985 | 2,26 | 71 % | 10 ms/frame |
+| OC-SORT | 0,992 | 2,20 | 69 % | 13 ms/frame |
+| **BoT-SORT** (ReID OSNet + compensation caméra) | **0,987** | **1,03** | **97 %** | 547 ms/frame |
+
+1. **BoT-SORT est le seul à être à la fois pur et d'un seul tenant.** ByteTrack et OC-SORT
+   sont purs mais coupent chaque objet en ~2 morceaux (4 sur M0601, haute altitude) : autant
+   de décisions en plus à la revue. Le tracker maison fragmente moins qu'eux mais mélange.
+2. **L'apparence fait la différence** : sur M0601, 145 pistes pour 51 objets avec BoT-SORT,
+   723 avec ByteTrack, pour la même pureté.
+3. **Le seuil SAM 3 compte peu pour la pureté** (0,985-0,987 de 0,15 à 0,5 pour BoT-SORT) ;
+   à 0,5 la couverture est la meilleure.
+4. **Coût** : 547 ms/frame sur CPU, soit 2,7 h pour 10 min de vidéo à 30 fps. Il faut la
+   ReID sur GPU (réparer cuDNN dans `.venv-tracking`, ou l'installer dans un venv sain).
+5. **« FP en piste » (~35 %) surestime les faux positifs de SAM 3** : UAVDT a des zones
+   ignorées où des véhicules visibles ne sont pas annotés. La pureté, calculée sur les seules
+   détections appariées, n'en dépend pas.
+6. **Portée** : 3 séquences, véhicules seuls, ReID entraînée sur des piétons (MSMT17).
+
+**Les annotations existantes ont le même défaut.** Dans `Track Review` sur la séquence B
+`145902 00h07m30s` (1 fps), la piste 20 alterne voiture bleue / voiture blanche d'une frame
+à l'autre : ce n'est pas un seul changement d'objet, une découpe ne suffit pas.
+
+### Revue des pistes dans le client — `Tool > Track Review`
+
+`widgets/track_review_dialog.py` sur `utils/track_review.py` (sans Qt), tests
+`tests/test_utils/test_track_review.py` et `tests/test_widgets/test_track_review_dialog.py`.
+Une ligne par `group_id` : vignette de la boîte la plus grande (hors interpolées), durée,
+classe actuelle, proposition VLM si les attributs `vlm_class`/`vlm_prob` existent, menu de
+classe. La classe choisie est écrite sur toutes les formes de la piste, la classe grossière
+d'origine gardée dans l'attribut `coarse_label`. La piste sélectionnée montre 12 frames
+réparties sur sa durée ; **« Split from selected frame »** donne un nouveau `group_id` à
+cette frame et aux suivantes. « Accept suggestions above threshold » adopte les propositions
+VLM au-dessus du seuil. Seuls les fichiers touchés sont réécrits (écriture atomique).
+Manque : déplacer une frame isolée vers une autre piste (cas des alternances), supprimer une
+piste de faux positifs.
 
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 

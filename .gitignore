@@ -8,3 +8,4 @@ __pycache__/
 
 # Sorties de mesure (JSON bruts, decoupages)
 /runs/
+/.venv-tracking/
