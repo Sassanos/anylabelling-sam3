@@ -17,6 +17,8 @@ Notes de reprise. Dernière mise à jour : 2026-09-16.
 | `mesure-rappel-coco.py` | inférence sur un échantillon COCO annoté ; garde les prédictions brutes avec leur score |
 | `rappel-par-taille.py` | rappel et précision par tranche de taille, hors ligne, sur un ou plusieurs runs |
 | `sam3-official-patches/` | patch local de `sam3-official` (délestage, à appliquer sur l'amont `660a5e9`) et `run_sam31.py` |
+| `mesure-vlm.py` | classe au VLM des objets annotés (Campagne_1 ou jeu COCO) ; garde les probabilités de chaque choix |
+| `vlm-par-classe.py` | exactitude par classe, modalité, taille, piste et seuil, hors ligne, sur un ou plusieurs runs |
 
 Les deux forks sont sur une branche `sam3` = `origin/main` + des patches perso
 jamais poussés en amont. Tags de secours de l'état d'avant le rebase du
@@ -477,6 +479,82 @@ de dépasser le plafond de 200 requêtes par prompt. Mais la question « rappel 
 doublons ? » est la même que celle qui oppose SAM 3 à SAM 3.1, et elle demande la même
 chose : **le lot L0, désormais faisable** — `Datasets/release/` contient 18 jeux annotés
 en COCO, dont `rgbtdroneperson` (99,9 % d'objets < 32², côté médian 11,2 px).
+
+## VLM après SAM 3 — lot V0, mesuré le 2026-09-16
+
+But : donner une classe fine aux détections SAM 3 (Griffon, VAB, GBC, VT4, Masstech T4 ;
+voiture, pick-up, camionnette, camion, bus, deux-roues, engin pour les civils) et filtrer
+ses faux positifs. Modèle : **Qwen3.5-4B** en bf16, local.
+
+**Mécanique** (`X-AnyLabeling-Server/app/utils/crop_classifier.py`, tests
+`tests/test_crop_classifier.py`) : découpage carré centré (marge 0,5 × côté, 16 px min),
+gris hors image, agrandi à 448-896 px — un token Qwen3.5 couvre 32 px (patch 16, fusion
+2×2). Choix fermés en lettres, lus sur les logits du prochain token, thinking coupé
+(`enable_thinking=False`) : une passe, pas de parsing. Backend `transformers` ou
+OpenAI/vLLM (`logprobs`, non encore essayé). **9,1 Gio de crête, 130-200 ms par
+découpage**, masse des lettres 0,98-0,999 : le modèle répond bien par une lettre.
+
+**Vérité terrain : `Datasets/real/Campagne_1`**, lue dans les zips. Labels à normaliser
+(`person`/`Person`, `Véhicule civil`/`Véhicule Civil`). Échantillon : 627 découpages,
+au plus 6 frames par piste. **Peu de véhicules physiques** : les scans tournent autour
+d'un même Griffon ou VAB, donc 131 découpages Griffon ≠ 131 Griffon. Les chiffres par
+piste sont les plus honnêtes, et ils restent sur un ou deux engins par type. GBC : 10
+découpages, tous sous 16 px — rien de mesurable.
+
+| Question | Griffon | VAB | Civil | Personnes rejetées |
+|---|---|---|---|---|
+| complète (sous-classe + « pas un véhicule » + « incertain »), cadre | 37 % | 27 % | 49 % | 100 % |
+| sous-classe seule, cadre | 35 % (famille 95) | **71 %** | 84 % | — |
+| sous-classe seule, sans cadre | **51 %** (famille 96) | 56 % | 84 % | — |
+| binaire véhicule / non, cadre, argmax | 79 % | 100 % | 63 % | 78 % |
+| binaire, sans cadre, argmax | 89 % | 100 % | 86 % | 58 % |
+
+(« famille » = militaire bien rangé chez les militaires ; civil = toute sous-classe civile.)
+
+Ce qu'on en tire :
+1. **Ne jamais mettre le rejet dans la liste des sous-classes.** L'option « pas un
+   véhicule » y aspire 45 % des Griffon et 49 % des civils, y compris des voitures nettes
+   à 0,6-0,9. Le 100 % de personnes rejetées ne vaut donc rien. SAM 3 a déjà dit
+   « véhicule » : on ne demande que le type, et le rejet se fait par une question à part.
+2. **Militaire / civil : fiable. Type exact : non.** Famille 95-100 % ; mais Griffon, VAB,
+   VT4 et Masstech se confondent (35-71 % selon le cadre). Par piste, sans cadre :
+   Griffon RGB 9/13, civil RGB 24/25.
+3. **Filtre de faux positifs : seuiller P(véhicule), pas l'argmax.** Question binaire avec
+   cadre, objets ≥ 16 px : seuil 0,1 → 99 % des véhicules gardés, 75 % des personnes
+   rejetées ; seuil 0,2 → 96 % / 85 % ; 0,3 → 90 % / 93 %. **Les personnes ne sont qu'un
+   substitut** : les vrais faux positifs de SAM 3 (ombres, buissons, bâches) restent à
+   mesurer.
+4. **Le cadre rouge aide le binaire et le VAB, gêne le Griffon.** Pas de réglage unique ;
+   à retrancher sur plus de véhicules.
+5. Échecs lisibles sur planche (`runs/vlm/planche-*.jpg`) : Griffon **sous filet ou bâche**,
+   frames quasi noires, blindés **vus du dessus** sur piste, et un VAB peu connu du modèle.
+
+### Séquences B, bâches exclues
+
+Les vidéos `B_*` sont la cible prioritaire. **Les quatre séquences B avec un Griffon le
+montrent bâché sous un filet** (103746, 105526, 145902 `00h00m00s` et `00h02m30s`,
+vérifié sur toutes les frames) ; ce cas est jugé trop difficile et **mis de côté**. Restent
+`145902 00h05m00s` et `00h07m30s` : 163 découpages de véhicules civils (21 pistes),
+195 de personnes, 9 GBC sous 16 px et flous. Filtre :
+`./vlm-par-classe.py --prefixe B_ --exclure 103746,105526,00h00m00s,00h02m30s run.json`.
+
+- **Civils, sous-classe seule, sans cadre, descriptions v1 : famille 87 % par découpage,
+  19/21 pistes.** Au-dessus de 0,5 de confiance : 74 % des découpages gardés, **100 %
+  justes**. Relu sur planche (`runs/vlm/planche-B-civils-sousclasses.jpg`, sans vérité
+  terrain fine) : camionnettes à 0,96-0,99, voitures à 0,9-0,99 ; les erreurs sont toutes
+  sous 0,5 (véhicule à moitié caché, utilitaire de 37 px).
+- **Filtre binaire, avec cadre, objets ≥ 16 px** : seuil 0,1 → 98 % des véhicules gardés,
+  80 % des personnes rejetées ; 0,2 → 96 % / 91 % ; 0,3 → 93 % / 96 %.
+- **Descriptions v2 (`--descriptions v2`) : à ne pas garder.** Écrites pour le Griffon
+  bâché (essieux, cabine séparée, « souvent sous filet »), elles le font passer de 7 % à
+  53-62 % sur les séquences bâchées, mais envoient 29 % des civils vers `gbc` et font
+  tomber les civils de 87 % à 57 %. Le « 100 % GBC » qu'elles affichent vient du même
+  attracteur, pas d'une reconnaissance.
+- GBC : rien de mesurable (9 découpages de 8-16 px).
+
+Descriptions données au modèle : `MILITAIRES` et `CIVILS` en tête de `mesure-vlm.py`
+(sources defense.gouv.fr et Wikipédia pour VT4 et Masstech T4). Sorties brutes dans
+`runs/vlm/` (hors git).
 
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
