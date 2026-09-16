@@ -36,6 +36,11 @@ Trois dépôts **privés** sur le compte `Sassanos`, poussés le 2026-09-16 :
   être privé. `origin` pointe toujours vers l'amont, pour les rebases.
 - SSH via l'alias `github-sassanos` (`~/.ssh/config`, clé `~/.ssh/id_ed25519_sassanos`) :
   un autre compte GitHub sert aussi sur ce portable, chacun a sa clé et son alias.
+- **Le port 22 est bloqué sur ce réseau**, seul le proxy HTTP `troie.ia` sort. L'alias
+  passe donc par `ssh.github.com:443` avec
+  `ProxyCommand nc -X connect -x proxy-cache.utils.dmz.troie.ia:3128 %h %p`. Symptôme
+  sans ça : `ssh: connect to host github.com port 22: Connection timed out`.
+- `gh` 2.101.0 est installé dans `~/.local/bin`, mais pas authentifié.
 - Identité `Sassanos <239545955+Sassanos@users.noreply.github.com>` limitée à ce dossier
   par un `includeIf` dans `~/.gitconfig` (→ `~/.gitconfig-sassanos`).
 - L'auteur des commits perso a été réécrit le 2026-09-16 (contenu identique, dates
