@@ -6,6 +6,9 @@
 __pycache__/
 *.pt
 
+# Instructions SLURM : ne pas versionner
+/SLURM_INSTRUCTIONS.md
+
 # Sorties de mesure (JSON bruts, decoupages)
 /runs/
 /.venv-tracking/

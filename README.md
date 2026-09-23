@@ -1,6 +1,6 @@
 # Annotation SAM 3 / SAM 3.1 — état du chantier
 
-Notes de reprise. Dernière mise à jour : 2026-09-16.
+Notes de reprise. Dernière mise à jour : 2026-09-23.
 
 ## Ce qu'il y a ici
 
@@ -19,6 +19,11 @@ Notes de reprise. Dernière mise à jour : 2026-09-16.
 | `sam3-official-patches/` | patch local de `sam3-official` (délestage, à appliquer sur l'amont `660a5e9`) et `run_sam31.py` |
 | `mesure-vlm.py` | classe au VLM des objets annotés (Campagne_1 ou jeu COCO) ; garde les probabilités de chaque choix |
 | `vlm-par-classe.py` | exactitude par classe, modalité, taille, piste et seuil, hors ligne, sur un ou plusieurs runs |
+| `annote-video-sam3.py` | annotation à la cadence native d'un flux vidéo via le serveur : décodage streaming (aucune frame sur disque), JSONL par tronçon, reprise à la frame près |
+| `planche-controle.py` | planches visuelles : frames décodées en streaming + boîtes des JSONL (couleur par label) |
+| `slurm/` | déploiement cluster : jobs array, génération de tâches, bilan de lot — voir `slurm/README.md` |
+| `TRACKER-PISTES.md` | notes de reprise pour l'association des pistes (group_id) sur les JSONL du cluster |
+| `SLURM_INSTRUCTIONS.md` | règles du cluster pour l'assistant — **HORS GIT** (ignoré, ne pas le committer) |
 
 Les deux forks sont sur une branche `sam3` = `origin/main` + des patches perso
 jamais poussés en amont. Tags de secours de l'état d'avant le rebase du
