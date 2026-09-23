@@ -792,6 +792,28 @@ Refuse un vol dont un tronçon n'a pas son `.done` (`--partiel` pour passer outr
   traversent un zoom (#483 : 0,35) sortent plus « rompues » que les vraies impures
   (#276 : 0,31). Le zoom change l'apparence autant qu'un changement d'objet.
 
+### Résultat sur 0000012
+
+Vol quatre fois plus dense, vu de dessus, véhicules plus petits (23 px médians contre 60) :
+
+| | |
+|---|---|
+| Frames, détections | 40 066 frames (6 tronçons continus), 1 170 966 détections |
+| Indices / association | 20,6 min (32 frames/s) / 125 s ; cache 1,2 Go, pistes 92 Mo |
+| Après fusion des doublons | véhicules 1 049 916 → 795 395 (−24 %, contre −41 % sur 0000011 : presque tout sort en `car`) |
+| Pistes ≥ 5 détections | **13 230** : 11 719 véhicules, 1 511 personnes ; 8 069 de plus d'une seconde |
+| Couverture | véhicules 0,84, personnes 0,75 |
+| Longueur (détections) | médiane 28, p90 134, max 1 063 |
+| Pic | ~630 détections de ~22 px par frame autour du sample 27540 (grand parc de véhicules), 536 pistes actives dont 414 détectées sur la frame |
+
+- **Véhicules** : les pistes longues sont nettes (#507 à #514, voitures d'un parking
+  suivies 29 s chacune à travers un zoom). Des sauts d'objet restent possibles quand la
+  caméra bouge vite (#1215, #1661).
+- **Personnes : beaucoup de faux positifs suivis**, dont un panneau jaune (#1085), un
+  panneau rond (#1182) et des taches floues. Leurs scores (0,41-0,47) sont ceux des vraies
+  personnes (#135, #1400) : le score ne les sépare pas, c'est au tri par piste (VLM,
+  revue) de le faire.
+
 ### Visualiser
 
 ```bash
@@ -811,10 +833,16 @@ suffisant pour voir une piste sauter d'un objet à l'autre. Boîte pleine = dét
 pointillée = interpolée ; traîne = centres des 20 dernières frames (repère image, non
 compensé). La vidéo saute les rafales IR ; le bandeau donne le sample_index.
 
+Quand la caméra balaie (0000012 autour de 27540 : 530 pistes sur toute l'image), les
+traînes deviennent de longs traits horizontaux, qui montrent le mouvement de la caméra et
+non celui des véhicules. `--zone auto` ne peut pas zoomer quand les pistes couvrent
+toute l'image. Préférer `--traine 0` et une zone fixe en pixels 4K
+(`--zone 1000 300 2600 1200`).
+
 ### Suite
 
-- Les autres vols : 0000012 est complet (toutes ses `.done`), 0000018 finit dans la
-  journée. Même commande, ~7 min pour 16 000 frames.
+- 0000018 : finit dans la journée, même commande. ~22 700 frames (78 742 au lot moins
+  les deux autres vols), soit ~11 min d'indices à 32-38 frames/s.
 - Export des pistes retenues vers des JSON X-AnyLabeling par frame pour `Track Review`
   (les `shapes` y mènent), puis classe fine par piste au VLM.
 - Zooms rapides : pistes impures, c'est là que la revue doit regarder d'abord. Piste
