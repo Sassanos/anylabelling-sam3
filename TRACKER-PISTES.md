@@ -1,5 +1,12 @@
 # Association des pistes (group_id) — notes de reprise pour la session tracker
 
+> **Fait le 2026-09-23 (après-midi)** : `associe-pistes.py` (BoT-SORT réécrit
+> sans boxmot, parité mesurée sur UAVDT) a produit les pistes du vol 0000011
+> dans `annots-sam3/pistes/0000011/`, au format proposé plus bas (plus
+> `coarse`, `labels`, `shapes`). Visualisation : `rendu-pistes.py`,
+> `planche-pistes.py`. Tout est décrit dans le README, section « Pistes
+> BoT-SORT sur un vol entier ». Le reste de ce document est l'état du matin.
+
 Document autonome, écrit le 2026-09-23 matin. S'adresse à une session de
 programmation qui démarre à froid. À lire en entier avant de coder.
 

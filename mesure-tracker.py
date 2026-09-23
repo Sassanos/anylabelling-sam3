@@ -17,8 +17,9 @@ Les sequences MOT d'UAVDT (drone, vehicules, 30 fps, 1024x540) portent un
   qui ne s'apparient a rien sont des faux positifs, comptes a part.
 
 Trackers : `maison` (group_id_association.py du client, charge par chemin pour
-ne pas importer Qt) et ceux de boxmot (bytetrack, ocsort, botsort...), dans le
-venv .venv-tracking qui l'a installe.
+ne pas importer Qt), `botsort-maison` (pistes_botsort.py + reid_osnet.py,
+BoT-SORT reecrit sans boxmot) et ceux de boxmot (bytetrack, ocsort, botsort...),
+dans le venv .venv-tracking qui l'a installe.
 
     .venv-tracking/bin/python mesure-tracker.py --tracker maison bytetrack \\
         ocsort botsort --detections runs/tracker/sam3-uavdt.json \\
@@ -163,6 +164,25 @@ def track_maison(kept, per_frame, config, cache_gmc, key):
     return [[(d.frame, d.shape_idx) for d in t.members] for t in tracks]
 
 
+def track_botsort_maison(kept, per_frame, cache_gmc, key, encodeur, params):
+    """BoT-SORT reecrit : meme GMC que `maison`, ReID OSNet sur chaque frame."""
+    import cv2
+    from pistes_botsort import BotSort
+    if key not in cache_gmc:
+        tuples = [(n, os.path.splitext(image)[0] + ".json", {})
+                  for n, (_, image, _) in enumerate(kept)]
+        cache_gmc[key] = gia.build_gmc(tuples, os.path.dirname(kept[0][1]),
+                                       0.5)[0]
+    gmc = cache_gmc[key]
+    tracker = BotSort(params)
+    for number, (_, image, _) in enumerate(kept):
+        rows = per_frame[number]
+        descs = encodeur(cv2.imread(image), rows[:, :4]) if len(rows) else None
+        tracker.update(number, rows[:, :4], rows[:, 4], descs,
+                       gmc.get(number))
+    return [[(m[0], m[1]) for m in t.membres] for t in tracker.pistes()]
+
+
 def make_boxmot(name, fps, device):
     import boxmot
     classes = {"bytetrack": "ByteTrack", "ocsort": "OcSort",
@@ -263,7 +283,13 @@ def main():
                     help="surcharge un champ de TrackingConfig du tracker "
                          "maison, ex. --set max_dist=1.0 (repetable)")
     ap.add_argument("--device", default="cpu",
-                    help="ReID des trackers boxmot")
+                    help="ReID des trackers boxmot et de botsort-maison")
+    ap.add_argument("--reid-poids",
+                    default=os.path.join(HERE, "poids",
+                                         "osnet_x0_25_msmt17.pt"))
+    ap.add_argument("--botsort-set", action="append", default=[],
+                    metavar="CLE=VAL",
+                    help="surcharge un champ de ParamsBotSort (botsort-maison)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -275,6 +301,18 @@ def main():
         key, value = item.split("=", 1)
         current = getattr(config, key)
         setattr(config, key, type(current)(value))
+
+    params_bs = encodeur = None
+    if "botsort-maison" in args.tracker:
+        from pistes_botsort import ParamsBotSort
+        from reid_osnet import EncodeurOSNet
+        params_bs = ParamsBotSort()
+        for item in args.botsort_set:
+            key, value = item.split("=", 1)
+            current = getattr(params_bs, key)
+            setattr(params_bs, key, value.lower() in ("1", "true", "oui")
+                    if isinstance(current, bool) else type(current)(value))
+        encodeur = EncodeurOSNet(args.reid_poids, device=args.device)
 
     if args.detections:
         det_file = json.load(open(args.detections))
@@ -304,6 +342,10 @@ def main():
                     if name == "maison":
                         tracks = track_maison(kept, per_frame, config,
                                               cache_gmc, (seq, stride))
+                    elif name == "botsort-maison":
+                        tracks = track_botsort_maison(
+                            kept, per_frame, cache_gmc, (seq, stride),
+                            encodeur, params_bs)
                     else:
                         tracks = track_boxmot(name, kept, per_frame,
                                               30 / stride, args.device)
@@ -327,6 +369,7 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     json.dump({"args": vars(args), "config": vars(config),
+               "botsort_maison": vars(params_bs) if params_bs else None,
                "results": results}, open(args.out, "w"), indent=1)
 
     print("\n== Moyenne sur les sequences (ponderee par detections)")

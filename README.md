@@ -23,6 +23,11 @@ Notes de reprise. Dernière mise à jour : 2026-09-23.
 | `planche-controle.py` | planches visuelles : frames décodées en streaming + boîtes des JSONL (couleur par label) |
 | `slurm/` | déploiement cluster : jobs array, génération de tâches, bilan de lot — voir `slurm/README.md` |
 | `TRACKER-PISTES.md` | notes de reprise pour l'association des pistes (group_id) sur les JSONL du cluster |
+| `associe-pistes.py` | pistes (group_id) d'un vol entier, BoT-SORT hors ligne sur les JSONL du cluster → `annots-sam3/pistes/<vol>/` |
+| `pistes_botsort.py`, `reid_osnet.py`, `pistes_io.py` | BoT-SORT réécrit (sans boxmot), descripteurs OSNet, lecture des tronçons et décodage NVDEC en streaming |
+| `rendu-pistes.py` | vidéo MP4 de contrôle des pistes (couleur et numéro par piste, recadrage auto) |
+| `planche-pistes.py` | planche par piste : une ligne de vignettes réparties sur sa durée (contrôle de pureté) |
+| `poids/` | `osnet_x0_25_msmt17.pt` (zoo torchreid, 3 Mo) — **hors git** (`*.pt`) |
 | `SLURM_INSTRUCTIONS.md` | règles du cluster pour l'assistant — **HORS GIT** (ignoré, ne pas le committer) |
 
 Les deux forks sont sur une branche `sam3` = `origin/main` + des patches perso
@@ -658,6 +663,165 @@ cette frame et aux suivantes. « Accept suggestions above threshold » adopte le
 VLM au-dessus du seuil. Seuls les fichiers touchés sont réécrits (écriture atomique).
 Manque : déplacer une frame isolée vers une autre piste (cas des alternances), supprimer une
 piste de faux positifs.
+
+## Pistes BoT-SORT sur un vol entier — `associe-pistes.py`, 2026-09-23
+
+Suite de `TRACKER-PISTES.md` : associer en pistes les détections SAM 3 frame par frame
+du lot Slurm, **hors ligne**, par vol. Fait sur le vol **0000011** (15 954 frames,
+296 170 détections).
+
+### BoT-SORT réécrit, sans boxmot
+
+BoT-SORT était le meilleur sur UAVDT (section précédente), mais boxmot et ultralytics sont
+sous **AGPL-3.0**. Réécrit d'après l'article (arXiv:2206.14651) et le dépôt de référence
+`NirAharon/BoT-SORT` (MIT), sans une ligne de boxmot :
+
+- `pistes_botsort.py` — Kalman (cx, cy, w, h) à bruit proportionnel à la taille,
+  compensation caméra appliquée aux états prédits, cascade ByteTrack (sûres : IoU et
+  apparence fusionnées par un minimum ; faibles : IoU seule ; non confirmées), affectation
+  équivalente à `lap.lapjv(cost_limit)` via scipy. Ne lit ni vidéo ni fichier : l'appelant
+  donne boîtes, scores, descripteurs et affine caméra, d'où le rejeu depuis un cache.
+- `reid_osnet.py` — OSNet x0.25 réécrit avec les noms de couches de torchreid (MIT) pour
+  charger son poids `osnet_x0_25_msmt17.pt` tel quel (daté d'avril 2021, copié depuis
+  `.venv-tracking` dans `poids/`, hors git). **Descripteurs identiques à ceux de boxmot** :
+  cosinus ≥ 0,9999999 sur les mêmes boîtes.
+- Tourne dans **`X-AnyLabeling-Server/.venv`** (torch cu128, cuDNN sain, PyAV 18 avec
+  NVDEC), rien à installer. `.venv-tracking` ne sert plus qu'à boxmot.
+
+**Parité mesurée** (`mesure-tracker.py --tracker botsort-maison`, mêmes 3 séquences UAVDT,
+vraies détections SAM 3, score ≥ 0,5) :
+
+| | pureté | morceaux / objet | d'un seul tenant | M0601 | M0403 | coût |
+|---|---|---|---|---|---|---|
+| boxmot BoT-SORT | 0,987 | 1,03 | 97 % | 0,971 / 1,08 | 0,997 / 1,00 | 547 ms/frame (CPU) |
+| **botsort-maison** | **0,987** | **1,03** | **96,8 %** | 0,971 / 1,08 | 0,997 / 1,00 | ~40 ms/frame (GPU) |
+
+`fuse_score` (IoU pondérée par le score, défaut du dépôt de référence) : 1,04 morceau,
+pas mieux, laissé à `False` comme boxmot.
+
+### Seuils : SAM 3 n'est pas YOLOX
+
+Les seuils de BoT-SORT (0,5 pour une détection sûre, 0,6 pour ouvrir une piste) supposent
+des scores de type YOLOX. SAM 3 note les **personnes entre 0,25 et 0,59** : aucune piste
+personne ne naissait. Sur UAVDT (score ≥ 0,25) :
+
+| `track_high` / `new_track` | pureté | morceaux / objet | couverture |
+|---|---|---|---|
+| 0,5 / 0,6 (référence) | 0,986 | 1,03 | 0,84 |
+| 0,4 / 0,4 | 0,986 | 1,06 | 0,92 |
+| **0,3 / 0,3** (défaut de `associe-pistes.py`) | **0,986** | 1,06 | **0,96** |
+
+Descendre les seuils ne coûte rien en pureté. `ParamsBotSort` garde les défauts de
+référence ; `associe-pistes.py` applique `SEUILS_SAM3`.
+
+### Le pipeline
+
+1. **Indices** (une fois par vol, mis en cache) : décodage NVDEC du flux 0 en streaming,
+   affine caméra entre frames successives (flot optique clairsemé, mêmes réglages que
+   `group_id_association.py`, en 960 px de large), descripteur OSNet de **chaque**
+   détection → `pistes/<vol>/indices/<vol>_indices.npz` (304 Mo pour 0000011). Le cache
+   est reconnu par une empreinte du contenu des détections, pas des fichiers : recompresser
+   un tronçon ne l'invalide pas.
+2. **Association** (16 s pour le vol), rejouable à volonté :
+   - **doublons inter-prompts fusionnés** par classe grossière (NMS à IoU 0,6) : SAM 3
+     répond une fois par prompt, et sur 0000011 **132 000 paires de boîtes véhicule à
+     IoU > 0,7 portent deux labels fins différents** sur la même frame (car/van 51 000,
+     truck/van 28 000, car/truck 25 000). Sans fusion, chaque véhicule aurait deux pistes.
+     La boîte au meilleur score représente la grappe, tous ses labels votent ;
+   - BoT-SORT **par classe grossière** (`vehicle`, `person`) et **par tronçon continu** ;
+   - **trous IR** : un écart de plus de `--coupure` (5) frames arrête toutes les pistes.
+     Rien n'est recollé à travers un trou IR (0000011 : 8 tronçons continus) ;
+   - classe fine de la piste = **vote des scores** sur toutes ses frames, distribution
+     gardée (`labels`) ;
+   - trous internes **interpolés** (`interpolated: true`), pistes de moins de `--min-len`
+     (5) détections écartées.
+3. Sortie : `pistes/<vol>/<vol>_pistes_<tag>.jsonl` (une piste par ligne) et le bilan
+   `.json` (réglages, sources, tronçons continus, chiffres). `tag` =
+   `botsort-<empreinte des réglages>` : mêmes réglages → même fichier, mêmes `group_id`
+   (1..N, triés par apparition).
+
+```json
+{"group_id": 7, "coarse": "vehicle", "label": "car", "labels": {"car": 0.62, "van": 0.38},
+ "n_frames": 42, "n_detected": 40, "sample_min": 21340, "sample_max": 21381,
+ "t_min_s": 1307.4, "t_max_s": 1308.8, "score_mean": 0.81, "size_median_px": 41.0,
+ "frames": [{"i": 21340, "bbox": [x1, y1, x2, y2], "score": 0.9, "label": "car",
+             "shapes": [3, 17]},
+            {"i": 21341, "bbox": [...], "interpolated": true}, ...]}
+```
+
+`shapes` = indices des formes de la frame dans le JSONL source (la grappe, tête d'abord) :
+de quoi revenir aux détections d'origine, pour l'export vers le client ou le VLM.
+
+```bash
+PY=X-AnyLabeling-Server/.venv/bin/python
+$PY associe-pistes.py --vol 0000011                           # vol entier
+$PY associe-pistes.py --vol 0000011 --set track_buffer=60     # rejeu, cache réutilisé
+$PY associe-pistes.py --vol 0000011 --debut 19830 --fin 22330 --tag essai
+```
+
+Refuse un vol dont un tronçon n'a pas son `.done` (`--partiel` pour passer outre).
+
+### Résultat sur 0000011
+
+| | |
+|---|---|
+| Indices (décodage 4K NVDEC + GMC + ReID) | 6,9 min, 38 frames/s, 0 frame introuvable |
+| Association | 16 s |
+| Détections → après fusion des doublons | véhicules 255 650 → 151 399 ; personnes 40 520 (un seul prompt) |
+| Pistes ≥ 5 détections | **1 968** : 1 580 véhicules, 388 personnes ; 1 389 de plus d'une seconde |
+| Couverture (grappes dans une piste) | véhicules 0,89, personnes 0,85 |
+| Longueur (détections) | médiane 44, p90 204, max 917 (une personne suivie 30,8 s) |
+| Classes fines votées | car 1 006, van 270, truck 185, mil_tank 59, mil_truck 41, motorcycle 15 |
+
+**Contrôle visuel (planches, pas de vérité terrain) :**
+
+- **Personnes : propres**, y compris à 8 px (#933) et sur 26-30 s pour les soldats
+  devant le bâtiment (#89, #314-#317). Les pistes fausses sont des faux positifs à
+  score bas (#443 une clôture à 0,39, #531 à 0,33).
+- **Véhicules en scène stable** (parking, zone dense 19830-22330) : une piste par
+  véhicule, tenue à travers le dézoom de la caméra (échelle 0,88 par frame à 21136).
+- **Les impuretés se concentrent dans les zooms rapides et le flou** (tronçon
+  10000-12489, boîtes de 20 à 800 px) : #276 et #865 changent d'objet, #386 est ambigu.
+  Autour des toilettes cyan, étiquetées `car`, des pistes mélangent faux positif et
+  véhicule voisin.
+- **Le label fin de SAM 3 n'est pas fiable par frame** : sur une piste véhicule, le
+  label majoritaire ne pèse que 75 % des votes en médiane (car/van surtout). Ce qui
+  confirme qu'il faut décider la classe fine par piste (VLM, revue).
+- Essayé et **abandonné** : un score de « rupture d'apparence » par piste (cosinus
+  entre descripteurs OSNet avant/après la meilleure coupure). Les pistes pures qui
+  traversent un zoom (#483 : 0,35) sortent plus « rompues » que les vraies impures
+  (#276 : 0,31). Le zoom change l'apparence autant qu'un changement d'objet.
+
+### Visualiser
+
+```bash
+# vidéo 1080p, une couleur et un numéro par piste, recadrée sur les pistes,
+# détections restées hors piste en gris (≈1 min pour 2 500 frames)
+$PY rendu-pistes.py --vol 0000011 --debut 19830 --fin 22330 --zone auto --detections
+# survol du vol entier en accéléré x2 (≈4 min)
+$PY rendu-pistes.py --vol 0000011 --pas 2 --zone auto
+# planches : pistes les plus longues, tirées au hasard, une classe, ou des group_id précis
+$PY planche-pistes.py --vol 0000011 --n 40 --tri longueur --out planche.jpg
+$PY planche-pistes.py --vol 0000011 --tri aleatoire --classes person --out p.jpg
+$PY planche-pistes.py --vol 0000011 --gid 276 865 --k 12 --out douteuses.jpg
+```
+
+Sorties dans `pistes/0000011/rendus/`. Dans mpv ou VLC, `.` avance d'une frame :
+suffisant pour voir une piste sauter d'un objet à l'autre. Boîte pleine = détection,
+pointillée = interpolée ; traîne = centres des 20 dernières frames (repère image, non
+compensé). La vidéo saute les rafales IR ; le bandeau donne le sample_index.
+
+### Suite
+
+- Les autres vols : 0000012 est complet (toutes ses `.done`), 0000018 finit dans la
+  journée. Même commande, ~7 min pour 16 000 frames.
+- Export des pistes retenues vers des JSON X-AnyLabeling par frame pour `Track Review`
+  (les `shapes` y mènent), puis classe fine par piste au VLM.
+- Zooms rapides : pistes impures, c'est là que la revue doit regarder d'abord. Piste
+  possible : couper une piste quand la taille de la boîte diverge de l'échelle estimée
+  par la GMC.
+- Licence du poids OSNet : code torchreid MIT, mais entraîné sur MSMT17 (jeu de
+  recherche) — à regarder avant un déploiement hors recherche.
 
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
