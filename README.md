@@ -23,7 +23,7 @@ Notes de reprise. Dernière mise à jour : 2026-09-23.
 | `planche-controle.py` | planches visuelles : frames décodées en streaming + boîtes des JSONL (couleur par label) |
 | `slurm/` | déploiement cluster : jobs array, génération de tâches, bilan de lot — voir `slurm/README.md` |
 | `TRACKER-PISTES.md` | notes de reprise pour l'association des pistes (group_id) sur les JSONL du cluster |
-| `associe-pistes.py` | pistes (group_id) d'un vol entier, BoT-SORT hors ligne sur les JSONL du cluster → `annots-sam3/pistes/<vol>/` |
+| `associe-pistes.py` | pistes (group_id) d'un vol entier, BoT-SORT hors ligne sur les JSONL du cluster → `Datasets/real/AnafiUKR/pistes/<vol>/` (local) |
 | `pistes_botsort.py`, `reid_osnet.py`, `pistes_io.py` | BoT-SORT réécrit (sans boxmot), descripteurs OSNet, lecture des tronçons et décodage NVDEC en streaming |
 | `rendu-pistes.py` | vidéo MP4 de contrôle des pistes (couleur et numéro par piste, recadrage auto) |
 | `planche-pistes.py` | planche par piste : une ligne de vignettes réparties sur sa durée (contrôle de pureté) |
@@ -716,10 +716,16 @@ référence ; `associe-pistes.py` applique `SEUILS_SAM3`.
 
 ### Le pipeline
 
+**Où sont les sorties.** En local, dans `SORTIES` (`pistes_io.py`) =
+`~/Documents/Geolocalisation/Datasets/real/AnafiUKR/pistes/<vol>/`. Les entrées restent
+lues dans `/media/users/cbarbier/annots-sam3/` (détections, index, miroir des vidéos), où
+**rien n'est jamais supprimé ni modifié**. 0000011 et 0000012 ont d'abord été écrits sous
+`annots-sam3/pistes/`, puis copiés en local ; `--sortie` choisit un autre dossier.
+
 1. **Indices** (une fois par vol, mis en cache) : décodage NVDEC du flux 0 en streaming,
    affine caméra entre frames successives (flot optique clairsemé, mêmes réglages que
    `group_id_association.py`, en 960 px de large), descripteur OSNet de **chaque**
-   détection → `pistes/<vol>/indices/<vol>_indices.npz` (304 Mo pour 0000011). Le cache
+   détection → `<vol>/indices/<vol>_indices.npz` (304 Mo pour 0000011). Le cache
    est reconnu par une empreinte du contenu des détections, pas des fichiers : recompresser
    un tronçon ne l'invalide pas.
 2. **Association** (16 s pour le vol), rejouable à volonté :
@@ -735,7 +741,7 @@ référence ; `associe-pistes.py` applique `SEUILS_SAM3`.
      gardée (`labels`) ;
    - trous internes **interpolés** (`interpolated: true`), pistes de moins de `--min-len`
      (5) détections écartées.
-3. Sortie : `pistes/<vol>/<vol>_pistes_<tag>.jsonl` (une piste par ligne) et le bilan
+3. Sortie : `<vol>/<vol>_pistes_<tag>.jsonl` (une piste par ligne) et le bilan
    `.json` (réglages, sources, tronçons continus, chiffres). `tag` =
    `botsort-<empreinte des réglages>` : mêmes réglages → même fichier, mêmes `group_id`
    (1..N, triés par apparition).
@@ -814,6 +820,25 @@ Vol quatre fois plus dense, vu de dessus, véhicules plus petits (23 px médians
   personnes (#135, #1400) : le score ne les sépare pas, c'est au tri par piste (VLM,
   revue) de le faire.
 
+### Résultat sur 0000018
+
+Premier vol écrit directement en local. Vol clairsemé, beaucoup de rafales IR :
+
+| | |
+|---|---|
+| Frames, détections | 22 722 frames (**15 tronçons continus**), 162 635 détections |
+| Indices / association | 9,5 min (40 frames/s) / 11 s |
+| Après fusion des doublons | véhicules 149 120 → 104 763 (−30 %) ; personnes 13 515 |
+| Pistes ≥ 5 détections | **1 253** : 1 064 véhicules, 189 personnes ; 843 de plus d'une seconde |
+| Couverture | véhicules 0,88, personnes 0,79 |
+| Longueur (détections) | médiane 39, p90 185, max 1 230 (une voiture suivie 41 s pendant que la vue tourne) |
+
+- **Véhicules propres**, y compris des voitures floues de 10-12 px au score 0,39-0,47
+  (#83, #102, #111) et un camion à demi caché par un arbre (#162).
+- **Personnes** : les soldats sont bien suivis (#368, #369, #373). Faux positifs et cas
+  ambigus : une ombre de 668 px (#41), des boîtes contre une portière (#370, #383), des
+  taches de 14 px (#677, #680).
+
 ### Visualiser
 
 ```bash
@@ -828,7 +853,7 @@ $PY planche-pistes.py --vol 0000011 --tri aleatoire --classes person --out p.jpg
 $PY planche-pistes.py --vol 0000011 --gid 276 865 --k 12 --out douteuses.jpg
 ```
 
-Sorties dans `pistes/0000011/rendus/`. Dans mpv ou VLC, `.` avance d'une frame :
+Sorties dans `<vol>/rendus/`. Dans mpv ou VLC, `.` avance d'une frame :
 suffisant pour voir une piste sauter d'un objet à l'autre. Boîte pleine = détection,
 pointillée = interpolée ; traîne = centres des 20 dernières frames (repère image, non
 compensé). La vidéo saute les rafales IR ; le bandeau donne le sample_index.
@@ -841,8 +866,8 @@ toute l'image. Préférer `--traine 0` et une zone fixe en pixels 4K
 
 ### Suite
 
-- 0000018 : finit dans la journée, même commande. ~22 700 frames (78 742 au lot moins
-  les deux autres vols), soit ~11 min d'indices à 32-38 frames/s.
+- Lot AnafiUKR complet (0000011, 0000012, 0000018). CAMPAGNE3 : même commande par vol,
+  compter ~40 frames/s d'indices plus 10 s à 2 min d'association selon la densité.
 - Export des pistes retenues vers des JSON X-AnyLabeling par frame pour `Track Review`
   (les `shapes` y mènent), puis classe fine par piste au VLM.
 - Zooms rapides : pistes impures, c'est là que la revue doit regarder d'abord. Piste

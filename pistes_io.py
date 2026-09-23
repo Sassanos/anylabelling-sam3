@@ -2,8 +2,9 @@
 
 Détections : tronçons JSONL du lot Slurm (`annots/<vol>/`), vidéo : piste 0
 (DefaultVideo) du MP4 source, décodée en streaming, rien n'est écrit sur
-disque. Les sorties vont dans `<racine>/pistes/<vol>/`, à côté des
-détections, qui ne sont jamais modifiées. Voir TRACKER-PISTES.md pour les formats.
+disque. Les sorties vont en local dans `SORTIES/<vol>/`
+(`Datasets/real/AnafiUKR/pistes/`) ; les entrées ne sont jamais modifiées.
+Voir TRACKER-PISTES.md pour les formats.
 """
 from __future__ import annotations
 
@@ -20,9 +21,12 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
-# Détections, index et vidéos en lecture ; les sorties vont dans pistes/<vol>/.
-# Rien n'y est jamais supprimé ni modifié en dehors de pistes/.
+# Entrées : détections du lot Slurm, index et vidéos, lus sans jamais être
+# modifiés ni supprimés.
 RACINE = Path("/media/users/cbarbier/annots-sam3")
+# Sorties (pistes, cache d'indices, rendus), en local : <SORTIES>/<vol>/.
+SORTIES = Path("/home/cbarbier/Documents/Geolocalisation/Datasets/real/AnafiUKR"
+               "/pistes")
 
 
 @dataclass
@@ -51,7 +55,7 @@ def chemins_vol(vol: str, racine: Path = RACINE) -> Dict[str, Path]:
         "video": videos[0],
         "index": (racine / "campagne3_index" / "annotation" / vol / "index"
                   / "samples_default.csv"),
-        "pistes": racine / "pistes" / vol,
+        "pistes": SORTIES / vol,
     }
 
 

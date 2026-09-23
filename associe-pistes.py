@@ -2,8 +2,9 @@
 """Pistes (group_id) d'un vol annoté par SAM 3 frame par frame : BoT-SORT hors ligne.
 
 Lit les tronçons JSONL du lot Slurm (`annots/<vol>/`, tous terminés), écrit
-une piste par ligne dans `<racine>/pistes/<vol>/<vol>_pistes_<tag>.jsonl` et
-le bilan dans le `.json` de même nom. Les détections ne sont jamais modifiées.
+une piste par ligne dans `Datasets/real/AnafiUKR/pistes/<vol>/<vol>_pistes_<tag>.jsonl`
+(local) et le bilan dans le `.json` de même nom. Les détections ne sont jamais
+modifiées.
 
 Deux étapes, la première mise en cache :
 1. indices (coûteuse, une fois par vol) : décodage streaming du flux 0 (NVDEC
@@ -290,7 +291,7 @@ def main():
     ap.add_argument("--vol", required=True)
     ap.add_argument("--racine", type=Path, default=RACINE)
     ap.add_argument("--sortie", type=Path, default=None,
-                    help="défaut : <racine>/pistes/<vol>/")
+                    help="défaut : Datasets/real/AnafiUKR/pistes/<vol>/")
     ap.add_argument("--indices", default=None,
                     help="dossier du cache d'indices (défaut : <sortie>/indices)")
     ap.add_argument("--tag", default=None,
