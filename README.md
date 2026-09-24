@@ -27,6 +27,8 @@ Notes de reprise. Dernière mise à jour : 2026-09-23.
 | `pistes_botsort.py`, `reid_osnet.py`, `pistes_io.py` | BoT-SORT réécrit (sans boxmot), descripteurs OSNet, lecture des tronçons et décodage NVDEC en streaming |
 | `rendu-pistes.py` | vidéo MP4 de contrôle des pistes (couleur et numéro par piste, recadrage auto) |
 | `planche-pistes.py` | planche par piste : une ligne de vignettes réparties sur sa durée (contrôle de pureté) |
+| `verifie-pistes-vlm.py` | vérification des pistes au VLM (Qwen3.8 servi par vLLM sur Slurm) : faux positifs, pureté, parties de véhicule, classe fine ; + contenance géométrique |
+| `rapport-vlm-pistes.py`, `bilan-vlm-pistes.py` | pages HTML locales : une carte par piste (filtrable) / synthèse avec graphiques et galeries relues |
 | `poids/` | `osnet_x0_25_msmt17.pt` (zoo torchreid, 3 Mo) — **hors git** (`*.pt`) |
 | `SLURM_INSTRUCTIONS.md` | règles du cluster pour l'assistant — **HORS GIT** (ignoré, ne pas le committer) |
 
@@ -834,7 +836,9 @@ Premier vol écrit directement en local. Vol clairsemé, beaucoup de rafales IR 
 | Longueur (détections) | médiane 39, p90 185, max 1 230 (une voiture suivie 41 s pendant que la vue tourne) |
 
 - **Véhicules propres**, y compris des voitures floues de 10-12 px au score 0,39-0,47
-  (#83, #102, #111) et un camion à demi caché par un arbre (#162).
+  (#83, #102, #111). #162, d'abord lu comme « un camion à demi caché par un arbre », est
+  en fait **le bas de l'avant** d'un camion que #159 couvre en entier (contenu dans #159
+  sur 87 % de ses frames, relu le 2026-09-24) : une partie, pas un véhicule.
 - **Personnes** : les soldats sont bien suivis (#368, #369, #373). Faux positifs et cas
   ambigus : une ombre de 668 px (#41), des boîtes contre une portière (#370, #383), des
   taches de 14 px (#677, #680).
@@ -875,6 +879,123 @@ toute l'image. Préférer `--traine 0` et une zone fixe en pixels 4K
   par la GMC.
 - Licence du poids OSNet : code torchreid MIT, mais entraîné sur MSMT17 (jeu de
   recherche) — à regarder avant un déploiement hors recherche.
+
+## Vérifier les pistes au VLM — Qwen3.8-27B sur Slurm, 2026-09-24
+
+But : voir ce qu'un VLM plus gros que Qwen3.5-4B (lot V0) apporte aux pistes SAM 3 +
+BoT-SORT : rejeter les faux positifs, repérer les pistes impures et les parties de
+véhicule, proposer une classe fine. Modèle : `/media/shared/models/qwen/Qwen3.8-27B-FP8`
+(architecture Qwen3.5, FP8 par blocs, ~29 Go).
+
+**Visuels** (locaux, hors git, images base64) dans `Datasets/real/AnafiUKR/pistes/` :
+`vlm-bilan.html` (synthèse : chiffres, graphique, galeries relues), `vlm-essai-connus.html`
+(46 cas connus, quatre prompts côte à côte), `vlm-pilote-p3.html` (317 pistes, filtrable).
+
+### Mise en place
+
+- **Serveur** : `slurm/vllm-qwen38.sbatch`, vLLM 0.30.0 (torch 2.13 cu130), **une A100
+  80 Go** suffit (Marlin FP8 sur Ampere ; driver 580 des nœuds GPU : CUDA 13 OK). Chargement
+  ~8 min depuis ceph. Projet cluster : `/media/users/cbarbier/vlm-pistes/`.
+- **Environnement** : `slurm/setup-vllm-env.sbatch`, lancé une fois sur la partition `cpu`
+  (le `/tmp` du nœud de connexion fait 6 Go, un venv vLLM 7,7 Go). Construit dans `/dev/shm`
+  au chemin où le serveur le détarre, archivé en un seul fichier
+  (`vlm-pistes/env/vllm-qwen38-v1.tar.zst`, 3,3 Go) : aucun venv sur ceph. Tous les caches
+  (uv, pip, virtualenv, vLLM, Triton, Inductor, FlashInfer, CUDA) vont dans `/dev/shm`,
+  statistiques d'usage de vLLM coupées. Proxy du site passé par `https_proxy`.
+- **Réseau** : un pare-feu bloque les ports des nœuds de calcul, **même depuis le nœud de
+  connexion**. Ce qui marche : SSH jusqu'au nœud où tourne le job, en saut par le login,
+  `ssh -N -J master.slurm.troie.ia -L <port>:127.0.0.1:<port> gpu02.slurm.vm.troie.ia`
+  (port et nœud dans le journal du job).
+- **Client** (`verifie-pistes-vlm.py`, venv du serveur X-AnyLabeling) : 8 vues réparties sur
+  les frames détectées de la piste (boîte en rouge, un peu plus grande que la boîte) + une
+  vue large, décodées sur le PC (NVDEC, streaming) et rangées dans un zip par vol ; requêtes
+  parallèles ; réponse en **JSON contraint** (`response_format` json_schema), probabilités
+  lues sur les logprobs bruts. Reprise piste par piste.
+
+```bash
+PY=X-AnyLabeling-Server/.venv/bin/python
+$PY verifie-pistes-vlm.py --vol 0000018 --selection connus --serveur http://localhost:13610/v1
+$PY verifie-pistes-vlm.py --vol 0000018 --selection pilote --serveur ... --prompt p3
+$PY rapport-vlm-pistes.py <SORTIES>/0000018/vlm/0000018_vlm_rapide_p3.jsonl --out r.html
+$PY bilan-vlm-pistes.py                 # -> <SORTIES>/vlm-bilan.html
+```
+
+Questions posées, séparées (leçon de V0 : le rejet mis parmi les sous-classes aspire les
+vrais véhicules) : `same_object` + `different_views` (pureté), `real_object` (faux positif),
+`box_covers` (entier ou partie), et pour les véhicules `fine_class` (les 12 labels véhicule de
+`taxonomy.yaml`, décrits) + `affiliation`. Le VLM ne voit pas le label fin de SAM 3.
+
+### Le prompt compte plus que la réflexion — 46 cas relus
+
+Cas du README relus sur planche + 9 parties de véhicule vérifiées (dont #162 de 0000018) :
+
+| | rapide p1 | réflexion low p1 | rapide p2 | **rapide p3** |
+|---|---|---|---|---|
+| vrais objets gardés (23) | 23 | 22 | 19 | **22** |
+| faux positifs rejetés (7) | 2 | 4 | 7 | **6** |
+| pistes impures trouvées (4) | 1 | 2 | 2 | 2 |
+| pistes pures jugées pures (21) | 21 | 21 | 21 | 21 |
+| parties trouvées par le VLM (9) | — | — | 5 | **6** |
+| jetons sortis par piste (médiane) | 59 | 629 | 128 | 127 |
+
+1. **p1 hallucine des personnes sur les panneaux** (#1085 losange jaune « personne en gilet
+   haute visibilité », #1182 panneau rond), à P = 0,99. La réflexion ne corrige pas : elle
+   raisonne sur la vue large, où il y a d'autres personnes, et sur l'intro « le tracker a
+   suivi une personne ».
+2. **Décrire l'aspect avant de nommer (p2, p3) règle les panneaux.** p2 ajoute « le détecteur
+   se trompe souvent » : 4 vrais objets rejetés à P ≈ 0 (voitures de 10-11 px, un soldat),
+   le même effet d'attraction que le rejet dans V0. p3 retire cette phrase : meilleur
+   compromis. Ces 46 cas ont servi à régler le prompt : chiffres optimistes.
+3. **Réflexion `low`** : ~10× plus de jetons, ~0,4 piste/s au lieu de ~1,3, gain faible, et
+   **les probabilités tombent à 0/1** — plus de seuil possible. Pas retenue.
+4. Restent en p3 : #507 (voiture de 25 px vue de très haut, « boîtier ») rejetée, #677
+   (tache de 14 px) gardée comme personne.
+
+### Pilote — 317 pistes tirées au hasard, p3
+
+Strates tirées au hasard parmi les pistes d'au moins 10 détections, ~5 min de VLM :
+
+| strate | pistes | rejetées par le VLM | relu à l'œil |
+|---|---|---|---|
+| étiquetées militaires par SAM 3 | 44 | **70 %** | 12/12 rejets justes |
+| personnes | 98 | **43 %** | ~9/12 justes, 3 ambigus |
+| véhicules, zooms rapides (0000011) | 15 | 27 % | — |
+| véhicules | 118 | **17 %** | ~6/10 justes, 1 faux (#683 de 0000011, petite camionnette) |
+
+1. **Le prompt « tank » de SAM 3 accroche des cuves, un château d'eau, des conteneurs, des
+   buses en béton, des armoires** : 70 % des pistes `mil_*` ne sont pas des véhicules.
+2. **Personnes** : balises, panneaux, un chien, une personne sur une affiche, un sac à dos —
+   le tri que le score SAM 3 ne faisait pas sur 0000012.
+3. **Pureté : faible.** Le VLM compare mal 8 vues : les sauts entre deux véhicules semblables
+   (#1215) passent. 10 % des véhicules dits impurs, 20 % dans les zooms rapides.
+4. **Classe fine** : sur 79 `car` SAM 3 gardés, 44 confirmés, 19 → `van`, 8 → `truck` (vues
+   de haut), 7 → militaire ; pas de vérité terrain pour trancher.
+
+### Parties de véhicule : géométrie d'abord, VLM en second
+
+**Contenance géométrique** (sans VLM, `contenance()`) : une boîte véhicule est contenue sur
+une frame quand >= 80 % de son aire tombe dans la boîte d'une autre piste véhicule >= 1,5
+fois plus grande. Pistes contenues sur >= 80 % de leurs frames : **223/1 580 (14 %) sur
+0000011**, 262/11 719 (2 %) sur 0000012, 44/1 064 (4 %) sur 0000018. Les 9 relues sont
+toutes des parties (flanc ou bas de camionnette, arrière ou roues de SUV, avant de camion).
+
+Sur le pilote, les deux signaux se complètent (désaccords relus dans `vlm-bilan.html`) :
+- la géométrie rate les parties **dont le véhicule entier n'a pas de boîte** (arrière de SUV
+  #319, toit de camionnette #486, moitié de voiture #1766) — à revoir, pas à supprimer ;
+- le VLM rejette parfois une partie comme « pas un véhicule » (roue de secours #423, flanc
+  #449) — même décision au bout ;
+- fausse alerte géométrique : #1655 de 0000011, véhicule entier pris dans une boîte trop
+  grande.
+
+Règle proposée : **contenue → doublon à retirer ; partie selon le VLM seul → à revoir.**
+
+### Coût et suite
+
+~1 800-2 000 jetons d'entrée par piste, **~1,3 piste/s** sur une A100 à 36 requêtes
+parallèles : ~3,5 h pour les ~16 500 pistes des trois vols, plus 20-40 min de vignettes par
+vol (décodage via le réseau depuis le PC ; faisable sur le cluster). Suite possible : lot
+complet en p3 ; attributs `vlm_*` écrits pour `Track Review` ; la pureté demande autre chose
+qu'un VLM qui regarde 8 vues (comparer vue à vue, ou couper aux zooms).
 
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
