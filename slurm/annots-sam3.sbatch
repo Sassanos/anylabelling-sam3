@@ -102,9 +102,13 @@ set -e
 
 # --- Compaction : tronçon terminé -> JSONL compressé (quota de volume de
 # /media/users ; ~10x sur du JSON). Le .done suffit à la reprise/idempotence.
+# ATTENTION : le marqueur du client est <chunk>.done (avec .jsonl remplacé),
+# pas <chunk>.jsonl.done — confusion qui a fait échouer silencieusement toutes
+# les compactations précédentes.
 if [[ $RC -eq 0 ]]; then
-    CHUNK=$(printf "%s/%s_chunk_%07d_%07d.jsonl" "$OUT_ROOT" "$FLIGHT" "$START" "$END")
-    if [[ -f "${CHUNK}.done" && -f "$CHUNK" ]]; then
+    CHUNK=$(printf "%s/%s/%s_chunk_%07d_%07d.jsonl" "$OUT_ROOT" "$FLIGHT" "$FLIGHT" "$START" "$END")
+    DONE="${CHUNK%.jsonl}.done"
+    if [[ -f "$DONE" && -f "$CHUNK" ]]; then
         zstd -T4 -12 -q "$CHUNK" && rm -f "$CHUNK" && echo "JSONL compacté : ${CHUNK}.zst"
     fi
 fi

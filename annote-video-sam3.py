@@ -257,28 +257,10 @@ def main():
             "include_full_image": not args.no_full_image,
         })
 
-    container = av.open(args.video)
-    streams = container.streams.video
-    if args.stream_index >= len(streams):
-        print(f"[!] piste vidéo {args.stream_index} absente ({len(streams)} pistes)",
-              file=sys.stderr)
-        return 2
-    stream = streams[args.stream_index]
-    if stream.time_base.denominator != timescale or stream.time_base.numerator != 1:
-        print(f"[!] time_base inattendu {stream.time_base} (timescale index {timescale})",
-              file=sys.stderr)
-        return 2
-
-    def to_tick(pts):
-        return int(pts)  # time_base = 1/timescale => pts == dts_ticks
-
-    # Seek au plus proche keyframe AVANT la première frame à faire, puis on
-    # avance en décodant jusqu'à dépasser la dernière.
-    first = pending[0]
-    container.seek(first, stream=stream, backward=True, any_frame=False)
+    pending = sorted(pending)
     pending_set = set(pending)
     last = pending[-1]
-    saw_last = False
+    fait = [False] * len(pending)
 
     out = open(jsonl, "ab")
     if good_end:
@@ -290,97 +272,167 @@ def main():
     n_done = n_shapes = n_err = 0
     last_print = 0.0
     backoffs = (5, 15, 45)
-    try:
-        for packet in container.demux(stream):
-            for frame in packet.decode():
-                if frame.pts is None:
-                    continue
-                tick = to_tick(frame.pts)
-                if tick in pending_set:
-                    row = by_tick[tick]
-                    img = frame.to_ndarray(format="bgr24")
-                    h, w = img.shape[:2]
-                    ok, buf = cv2.imencode(".jpg", img,
-                                           [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_q])
-                    if not ok:
-                        rec_err = "erreur encodage jpeg"
-                    else:
-                        b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-                        t_inf = time.time()
-                        rec_err = None
-                        body = None
-                        for attempt in range(args.retries):
-                            try:
-                                r = sess.post(
-                                    f"{args.server}/v1/predict",
-                                    json={"model": args.model,
-                                          "image": f"data:image/jpeg;base64,{b64}",
-                                          "params": params},
-                                    timeout=args.timeout)
-                                r.raise_for_status()
-                                body = r.json()
-                                if body.get("error"):
-                                    rec_err = str(body)[:300]
-                                    body = None
-                                break
-                            except Exception as e:
-                                rec_err = str(e)[:300]
-                                if attempt < args.retries - 1:
-                                    time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
-                        t_inf = time.time() - t_inf
-                    if rec_err is not None:
-                        n_err += 1
-                        print(f"  !! sample {row['sample_index']} : {rec_err}", flush=True)
-                        rec = {"flight": args.flight,
-                               "sample_index": int(row["sample_index"]),
-                               "dts_ticks": tick,
-                               "error": rec_err}
-                    else:
-                        shapes = []
-                        for s in (body.get("data") or {}).get("shapes") or []:
-                            sh = shape_of(s, pmap, coarse, w, h, args.uncertain_below)
-                            if sh is not None:
-                                shapes.append(sh)
-                        rec = {"flight": args.flight,
-                               "sample_index": int(row["sample_index"]),
-                               "dts_ticks": tick,
-                               "dts_s": float(row.get("dts_s") or 0),
-                               "utc_us": row.get("utc_us") or None,
-                               "stem": f"{args.flight}_rgb_{tick * 1000 // timescale}",
-                               "width": w, "height": h,
-                               "shapes": shapes,
-                               "t_inf_s": round(t_inf, 3)}
-                        n_shapes += len(shapes)
-                    n_done += 1
-                    out.write(json.dumps(rec, ensure_ascii=False).encode("utf-8") + b"\n")
-                    if n_done % 25 == 0:
-                        out.flush()
-                        os.fsync(out.fileno())
-                    now = time.time()
-                    if now - last_print > 30:
-                        el = now - t0
-                        print(f"  {n_done}/{len(pending)} | {el:.0f}s | "
-                              f"{n_done / el:.2f} frames/s | {n_shapes} shapes | "
-                              f"{n_err} err", flush=True)
-                        last_print = now
-                    if n_err and args.max_errors and n_err >= args.max_errors:
-                        print("[!] trop d'erreurs, abandon du tronçon", file=sys.stderr)
-                        raise SystemExit(3)
-                if tick == last:
-                    saw_last = True
-                    break
-            if saw_last:
-                break
-    finally:
-        out.flush()
-        os.fsync(out.fileno())
-        out.close()
-        container.close()
+    decode_echecs: dict[int, int] = {}
+    corrompues_consecutives = 0
+    SEUIL_MUR = 12   # frames corrompues d'affilée -> le reste de la plage est
+                     # présumé illisible (fin d'enregistrement endommagée)
 
-    if not saw_last:
-        print(f"[!] fin de flux atteinte avant la dernière frame du tronçon "
-              f"(dernière demandée : dts {last})", file=sys.stderr)
-        return 3
+    # Boucle robuste : un paquet corrompu ou une transition de flux (rafales
+    # IR du DefaultVideo) fait lever à PyAV une InvalidDataError FATALE pour
+    # le décodeur. On ré-ouvre alors le conteneur depuis la première frame
+    # non faite ; après 3 passes sans progrès sur la même frame, elle est
+    # écrite en erreur et on passe à la suivante (reprise par --retry-errors).
+    idx = [0]
+    while idx[0] < len(pending):
+        cible = pending[idx[0]]
+        progres = 0
+        container = None
+        try:
+            container = av.open(args.video)
+            streams = container.streams.video
+            if args.stream_index >= len(streams):
+                print(f"[!] piste vidéo {args.stream_index} absente "
+                      f"({len(streams)} pistes)", file=sys.stderr)
+                return 2
+            stream = streams[args.stream_index]
+            if stream.time_base.denominator != timescale or stream.time_base.numerator != 1:
+                print(f"[!] time_base inattendu {stream.time_base} "
+                      f"(timescale index {timescale})", file=sys.stderr)
+                return 2
+            container.seek(cible, stream=stream, backward=True, any_frame=False)
+            for packet in container.demux(stream):
+                for frame in packet.decode():
+                    if frame.pts is None:
+                        continue
+                    tick = int(frame.pts)  # time_base = 1/timescale => pts == dts_ticks
+                    if idx[0] < len(pending) and tick == pending[idx[0]]:
+                        row = by_tick[tick]
+                        img = frame.to_ndarray(format="bgr24")
+                        h, w = img.shape[:2]
+                        ok, buf = cv2.imencode(".jpg", img,
+                                               [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_q])
+                        if not ok:
+                            rec_err = "erreur encodage jpeg"
+                        else:
+                            b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+                            t_inf = time.time()
+                            rec_err = None
+                            body = None
+                            for attempt in range(args.retries):
+                                try:
+                                    r = sess.post(
+                                        f"{args.server}/v1/predict",
+                                        json={"model": args.model,
+                                              "image": f"data:image/jpeg;base64,{b64}",
+                                              "params": params},
+                                        timeout=args.timeout)
+                                    r.raise_for_status()
+                                    body = r.json()
+                                    if body.get("error"):
+                                        rec_err = str(body)[:300]
+                                        body = None
+                                    break
+                                except Exception as e:
+                                    rec_err = str(e)[:300]
+                                    if attempt < args.retries - 1:
+                                        time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+                            t_inf = time.time() - t_inf
+                        if rec_err is not None:
+                            n_err += 1
+                            print(f"  !! sample {row['sample_index']} : {rec_err}", flush=True)
+                            rec = {"flight": args.flight,
+                                   "sample_index": int(row["sample_index"]),
+                                   "dts_ticks": tick,
+                                   "error": rec_err}
+                        else:
+                            shapes = []
+                            for s in (body.get("data") or {}).get("shapes") or []:
+                                sh = shape_of(s, pmap, coarse, w, h, args.uncertain_below)
+                                if sh is not None:
+                                    shapes.append(sh)
+                            rec = {"flight": args.flight,
+                                   "sample_index": int(row["sample_index"]),
+                                   "dts_ticks": tick,
+                                   "dts_s": float(row.get("dts_s") or 0),
+                                   "utc_us": row.get("utc_us") or None,
+                                   "stem": f"{args.flight}_rgb_{tick * 1000 // timescale}",
+                                   "width": w, "height": h,
+                                   "shapes": shapes,
+                                   "t_inf_s": round(t_inf, 3)}
+                            n_shapes += len(shapes)
+                        n_done += 1
+                        progres += 1
+                        out.write(json.dumps(rec, ensure_ascii=False).encode("utf-8") + b"\n")
+                        if n_done % 25 == 0:
+                            out.flush()
+                            os.fsync(out.fileno())
+                        now = time.time()
+                        if now - last_print > 30:
+                            el = now - t0
+                            print(f"  {n_done}/{len(pending)} | {el:.0f}s | "
+                                  f"{n_done / el:.2f} frames/s | {n_shapes} shapes | "
+                                  f"{n_err} err", flush=True)
+                            last_print = now
+                        if n_err and args.max_errors and n_err >= args.max_errors:
+                            print("[!] trop d'erreurs, abandon du tronçon",
+                                  file=sys.stderr)
+                            raise SystemExit(3)
+                        idx[0] += 1
+                        corrompues_consecutives = 0  # frame décodée : reset
+                    if idx[0] < len(pending) and pending[idx[0]] < tick:
+                        # frame attendue sautée par le décodeur : elle sera
+                        # reprise au tour suivant (boucle while) ; si le saut
+                        # se répète, le compteur d'échecs l'écrira en erreur.
+                        pass
+        except SystemExit:
+            raise
+        except av.error.FFmpegError as e:
+            progres = progres  # l'erreur peut survenir après des frames utiles
+            print(f"  !! décodage : {e}", flush=True)
+        finally:
+            if container is not None:
+                container.close()
+        if progres == 0:
+            decode_echecs[cible] = decode_echecs.get(cible, 0) + 1
+            if decode_echecs[cible] >= 2:
+                rec = {"flight": args.flight,
+                       "sample_index": int(by_tick[cible]["sample_index"]),
+                       "dts_ticks": cible,
+                       "error": "décodage impossible après 2 essais"}
+                out.write(json.dumps(rec, ensure_ascii=False).encode("utf-8") + b"\n")
+                out.flush()
+                os.fsync(out.fileno())
+                n_err += 1
+                n_done += 1
+                idx[0] += 1
+                corrompues_consecutives += 1
+                print(f"  !! frame {by_tick[cible]['sample_index']} marquée en erreur "
+                      f"(décodage), on continue", flush=True)
+                if corrompues_consecutives >= SEUIL_MUR:
+                    # Mur de corruption (fin d'enregistrement endommagée) :
+                    # le reste de la plage est présumé illisible, marqué d'un
+                    # coup, et le tronçon se termine proprement.
+                    reste = pending[idx[0]:]
+                    for tick in reste:
+                        rec = {"flight": args.flight,
+                               "sample_index": int(by_tick[tick]["sample_index"]),
+                               "dts_ticks": tick,
+                               "error": "zone corrompue (mur de décodage)"}
+                        out.write(json.dumps(rec, ensure_ascii=False).encode("utf-8") + b"\n")
+                        n_err += 1
+                        n_done += 1
+                    out.flush()
+                    os.fsync(out.fileno())
+                    idx[0] = len(pending)
+                    print(f"  !! mur de décodage après {SEUIL_MUR} frames "
+                          f"corrompues consécutives : {len(reste)} frames "
+                          f"restantes marquées en erreur", flush=True)
+            else:
+                time.sleep(2)
+
+    out.flush()
+    os.fsync(out.fileno())
+    out.close()
 
     tmp = done_marker.with_suffix(".done.tmp")
     tmp.write_text(
