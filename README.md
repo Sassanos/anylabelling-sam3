@@ -853,6 +853,9 @@ Premier vol écrit directement en local. Vol clairsemé, beaucoup de rafales IR 
 $PY rendu-pistes.py --vol 0000011 --debut 19830 --fin 22330 --zone auto --detections
 # survol du vol entier en accéléré x2 (≈4 min)
 $PY rendu-pistes.py --vol 0000011 --pas 2 --zone auto
+# verdicts du VLM : classe fine du VLM, rejetées en gris (ou --masquer-rejets),
+# suffixes partie / impure / ? (incertain) / mil (personne militaire)
+$PY rendu-pistes.py --vol 0000004 --debut 9000 --fin 10000 --zone auto --vlm p5
 # planches : pistes les plus longues, tirées au hasard, une classe, ou des group_id précis
 $PY planche-pistes.py --vol 0000011 --n 40 --tri longueur --out planche.jpg
 $PY planche-pistes.py --vol 0000011 --tri aleatoire --classes person --out p.jpg

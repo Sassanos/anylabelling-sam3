@@ -13,7 +13,11 @@ d'une frame, ce qui suffit à repérer un changement d'objet dans une piste).
   compensé du mouvement caméra) ;
 - `--detections` ajoute en gris les détections restées hors de toute piste ;
 - `--zone auto` recadre sur les pistes (objets de 20 px en 4K : illisibles
-  dans l'image entière réduite en 1920).
+  dans l'image entière réduite en 1920) ;
+- `--vlm p5` étiquette avec les réponses du VLM (verifie-pistes-vlm.py) :
+  classe fine du VLM, pistes rejetées en gris (`--masquer-rejets` pour les
+  cacher), `partie`, `impure` et `?` (objet incertain) en suffixe, `mil` pour
+  une personne militaire.
 
 Seules les frames annotées (RGB) sont rendues : la vidéo saute les rafales IR,
 le bandeau donne le sample_index et le temps.
@@ -69,6 +73,30 @@ def texte(img, t, org, echelle, coul, epais=1):
                 cv2.LINE_AA)
 
 
+GRIS_REJET = (140, 140, 140)
+
+
+def etiquette(gid, piste, reponse, avec_vlm):
+    """Texte d'une piste : classe fine votée par SAM 3, ou verdict du VLM."""
+    if not avec_vlm:
+        return f"{gid} {piste['label']}"
+    if reponse is None:
+        return f"{gid} {piste['label']} (sans VLM)"
+    if reponse["real_object"] == "no":
+        return f"{gid} rejete"
+    classe = reponse.get("fine_class") or "person"
+    suffixes = []
+    if piste["coarse"] == "person" and reponse.get("affiliation") == "military":
+        suffixes.append("mil")
+    if reponse["real_object"] == "unsure":
+        suffixes.append("?")
+    if reponse.get("box_covers") == "part":
+        suffixes.append("partie")
+    if reponse.get("same_object") == "no":
+        suffixes.append("impure")
+    return " ".join([str(gid), classe] + suffixes)
+
+
 def ouvre_encodeur(chemin: Path, largeur, hauteur, debit: Fraction, qualite):
     import av
     sortie = av.open(str(chemin), "w")
@@ -118,6 +146,11 @@ def main():
     ap.add_argument("--sortie", type=Path, default=None,
                     help="MP4 (défaut : <pistes>/rendus/<vol>_<tag>_<début>_<fin>.mp4)")
     ap.add_argument("--no-hwaccel", action="store_true")
+    ap.add_argument("--vlm", default=None, metavar="PROMPT",
+                    help="étiqueter avec les réponses du VLM (ex. p5)")
+    ap.add_argument("--mode-vlm", default="rapide")
+    ap.add_argument("--masquer-rejets", action="store_true",
+                    help="avec --vlm : ne pas dessiner les pistes rejetées")
     args = ap.parse_args()
 
     import av
@@ -127,6 +160,16 @@ def main():
     jeu = args.pistes or dernier_jeu(chemins["pistes"], args.vol)
     bilan = json.loads(jeu.with_suffix(".json").read_text())
     tag = bilan["tag"]
+    reponses = {}
+    if args.vlm:
+        f = jeu.parent / "vlm" / f"{args.vol}_vlm_{args.mode_vlm}_{args.vlm}.jsonl"
+        if not f.exists():
+            raise SystemExit(f"[!] pas de réponses VLM : {f}")
+        for ligne in open(f, encoding="utf-8"):
+            r = json.loads(ligne)
+            if r.get("reponse"):
+                reponses[r["group_id"]] = r["reponse"]   # la dernière fait foi
+        print(f"[i] {len(reponses)} pistes jugées par le VLM ({f.name})")
 
     # Frames à rendre : celles des tronçons continus annotés, dans la plage.
     samples = []
@@ -151,6 +194,9 @@ def main():
                 continue
             if p["n_detected"] < args.min_len or (
                     args.classes and p["coarse"] not in args.classes):
+                continue
+            if args.masquer_rejets and (reponses.get(p["group_id"]) or {}).get(
+                    "real_object") == "no":
                 continue
             gid = p["group_id"]
             pistes[gid] = p
@@ -179,8 +225,9 @@ def main():
     if manquants:
         raise SystemExit(f"[!] {len(manquants)} samples absents de l'index")
 
+    suffixe = f"_vlm-{args.vlm}" if args.vlm else ""
     sortie = args.sortie or (jeu.parent / "rendus" /
-                             f"{args.vol}_{tag}_{lo}_{hi + 1}.mp4")
+                             f"{args.vol}_{tag}_{lo}_{hi + 1}{suffixe}.mp4")
     sortie.parent.mkdir(parents=True, exist_ok=True)
 
     zone_fixe = None
@@ -253,9 +300,13 @@ def main():
                           vers_sortie(b[2], b[3]), (150, 150, 150), 1)
 
         actives = defaultdict(int)
+        rejetees = 0
         for gid, b, interp in par_frame.get(s, ()):
             p = pistes[gid]
-            coul = couleur(gid)
+            reponse = reponses.get(gid)
+            rejet = reponse is not None and reponse["real_object"] == "no"
+            rejetees += rejet
+            coul = GRIS_REJET if rejet else couleur(gid)
             p1 = vers_sortie(b[0], b[1])
             p2 = vers_sortie(b[2], b[3])
             p2 = (max(p2[0], p1[0] + 2), max(p2[1], p1[1] + 2))
@@ -269,15 +320,19 @@ def main():
             if interp:
                 rectangle_pointille(img, p1, p2, coul)
             else:
-                cv2.rectangle(img, p1, p2, coul, 2)
+                cv2.rectangle(img, p1, p2, coul, 1 if rejet else 2)
             if not args.sans_etiquette:
-                texte(img, f"{gid} {p['label']}", (p1[0], p1[1] - 4),
-                      0.42 if ech < 1 else 0.5, coul)
+                texte(img, etiquette(gid, p, reponse, bool(args.vlm)),
+                      (p1[0], p1[1] - 4), 0.42 if ech < 1 else 0.5, coul)
             actives[p["coarse"]] += 1
 
+        # bandeau sur fond assombri : lisible sur une image claire (sable, ciel)
+        img[:42] = (img[:42] * 0.35).astype(img.dtype)
         detail = " ".join(f"{c} {k}" for c, k in sorted(actives.items()))
+        verdict = (f"  |  VLM {args.vlm} : {rejetees} rejetee(s)"
+                   if args.vlm else "")
         texte(img, f"{args.vol}  sample {s}  |  {sum(actives.values())} "
-                   f"pistes ({detail})  |  {tag}", (12, 28), 0.7,
+                   f"pistes ({detail})  |  {tag}{verdict}", (12, 28), 0.7,
               (255, 255, 255), 2)
 
         cadre = av.VideoFrame.from_ndarray(img, format="bgr24")
