@@ -52,9 +52,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from pistes_io import (RACINE, chemins_vol, decode_frames,  # noqa: E402
-                       dernier_jeu, en_tache_de_fond, ticks_index)
-
-TIMESCALE = 30000
+                       dernier_jeu, en_tache_de_fond, largeur_sol_m,
+                       telemetrie_index, ticks_index, timescale_index)
 
 # Réglages des vues par version de prompt : changent l'empreinte du zip (un
 # zip par réglage). p2 : un peu plus de marge (voir le reste d'un véhicule
@@ -70,6 +69,22 @@ VUES_PROMPT = {
 # p3 : questions de p2 sans « le détecteur se trompe souvent » ni « only if
 # clearly », qui faisaient rejeter de vrais objets (4/23 sur les cas connus).
 VUES_PROMPT["p3"] = VUES_PROMPT["p2"]
+# p4 : mêmes vues, questions réglées sur la revue humaine (texte_question_p4).
+VUES_PROMPT["p4"] = VUES_PROMPT["p2"]
+# p5 : p3 retouché d'après les erreurs de p4 (texte_question_p5), mêmes vues.
+VUES_PROMPT["p5"] = VUES_PROMPT["p2"]
+# p6 : p5 + largeur au sol estimée par la télémétrie (taille_piste_m), pour
+# l'échelle que les vues agrandies font perdre (chaises, bidons, mallettes
+# pris pour des personnes ou des véhicules ; statue de 2,9 m). Une boîte peut
+# être plus petite que l'objet (occlusion, partie) : un indice, jamais une
+# raison de rejet à elle seule.
+VUES_PROMPT["p6"] = VUES_PROMPT["p2"]
+# p7 : taille pour les véhicules seulement, phrase neutre (sans parler de
+# rejet : en p6 elle attirait les rejets, véhicules pris pour un arbre ou un
+# oiseau). Rien pour les personnes : vues à la verticale, seules la tête et
+# les épaules paraissent, le VLM y voyait un déchet (remarque utilisateur).
+VUES_PROMPT["p7"] = VUES_PROMPT["p2"]
+PROMPTS_TAILLE = {"p6", "p7"}
 # Contenance géométrique (sans VLM) : une boîte véhicule est « contenue » sur
 # une frame quand >= 80 % de son aire tombe dans la boîte d'une autre piste
 # véhicule au moins 1,5 fois plus grande — une partie d'un véhicule déjà suivi.
@@ -153,6 +168,66 @@ CLASSES_VEHICULE = [
      "artillery, ...)"),
     ("vehicle_unknown", "a vehicle whose type cannot be determined"),
 ]
+# p4 (2026-09-29), d'après la revue humaine de 134 pistes de jour
+# (revue-pistes.py) : faux positifs vus = groupes électrogènes, blocs de béton,
+# bidon, mallettes, chaises, sacs, poubelle, statue, cuves ; véhicules
+# militaires d'allure civile (VT4, 4x4 sur base Ford Ranger) étiquetés car/van
+# par SAM 3 ; beaucoup de boîtes sur une partie (portière, coffre, moteur).
+NON_OBJETS_P4 = {
+    "vehicle": "an electric generator or other equipment on wheels or skids, a "
+               "container, water tank or cistern, a fuel can, concrete blocks, a "
+               "bin, a case, crates or bags, a chair or other furniture, a "
+               "statue, a road or traffic sign, a pole, a shadow, a bush, a rock, "
+               "part of a building, a road marking, debris",
+    "person": "a chair, a bag, a case, a bin, a post or pole, a sign, a statue, "
+              "a shadow, a bush, a rock, debris, part of a vehicle",
+}
+PARTIES_P4 = {
+    "vehicle": "only a door, the bonnet or engine, the boot or rear, the cab, "
+               "the cargo bed, a trailer, the roof or the wheels",
+    "person": "only the legs, an arm or the head",
+}
+CLASSES_VEHICULE_P4 = [
+    ("car", "civilian passenger car (sedan, hatchback, estate, SUV, civilian "
+     "pickup)"),
+    ("van", "civilian van: panel van, minivan, minibus or small van (e.g. "
+     "Renault Trafic, Citroen Berlingo)"),
+    ("truck", "civilian truck, lorry, semi-trailer or tanker"),
+    ("bus", "bus or coach"),
+    ("motorcycle", "motorcycle or scooter"),
+    ("bicycle", "bicycle"),
+    ("agri_vehicle", "tractor, agricultural or construction machinery"),
+    ("mil_tank", "tracked armoured vehicle with a turret and a large main "
+     "gun (tank)"),
+    ("mil_apc_ifv", "armoured personnel carrier or infantry fighting vehicle "
+     "(wheeled or tracked armoured hull, no large main gun)"),
+    ("mil_truck", "military truck, e.g. Renault GBC (military paint, often a "
+     "canvas-covered cargo bed)"),
+    ("mil_other", "other military vehicle: military car, 4x4 or pickup (e.g. "
+     "the French VT4, a Ford Ranger-based 4x4), engineering vehicle, unmanned "
+     "ground robot, artillery, ..."),
+    ("vehicle_unknown", "a vehicle whose type cannot be determined"),
+]
+assert [c for c, _ in CLASSES_VEHICULE_P4] == [c for c, _ in CLASSES_VEHICULE]
+# p5 : p4 rejetait des véhicules vrais (« generator or other equipment » attirait
+# les morceaux de véhicule : portière, roue de secours, arrière de VT4) et
+# poussait les voitures blanches en van (exemple Berlingo). On garde de p4 les
+# leurres concrets, VT4/GBC et la règle de la peinture militaire.
+NON_OBJETS_P5 = {
+    "vehicle": "road or traffic sign, pole, post, shadow, bush, rock, part of a "
+               "building, road marking, debris, container, water tank, crate, "
+               "case, bag, chair, bin, concrete block, statue",
+    "person": "vehicle part, chair, bag, case, bin, post, pole, sign, statue, "
+              "shadow, bush, rock, debris",
+}
+PARTIES_P5 = {
+    "vehicle": "only a door, a wheel, the bonnet or front, the engine, the boot "
+               "or rear, the cab, the cargo bed, a trailer or the roof",
+    "person": "only the legs, an arm or the head",
+}
+CLASSES_VEHICULE_P5 = [
+    (c, dict(CLASSES_VEHICULE_P4)[c] if c in ("mil_truck", "mil_other") else d)
+    for c, d in CLASSES_VEHICULE]
 OUI_NON = ["yes", "no", "unsure"]
 COUVERTURE = ["whole", "part", "unsure"]
 AFFILIATIONS = ["civil", "military", "unknown"]
@@ -307,6 +382,7 @@ def construire_vues(chemins, pistes, chemin_zip, reglage):
             (p["group_id"], "contexte", milieu))
 
     ticks = ticks_index(chemins["index"])
+    timescale = timescale_index(chemins["index"])
     samples = sorted(plan)
     images = {gid: {} for gid in metas}
     t0 = time.time()
@@ -342,7 +418,7 @@ def construire_vues(chemins, pistes, chemin_zip, reglage):
                 z.writestr(f"{gid}/{j}.jpg", images[gid][str(j)])
                 x1, y1, x2, y2 = f["bbox"]
                 vues.append({"n": j, "i": f["i"], "bbox": f["bbox"],
-                             "dt_s": round((ticks[f["i"]] - base) / TIMESCALE, 2),
+                             "dt_s": round((ticks[f["i"]] - base) / timescale, 2),
                              "taille_px": [round(x2 - x1), round(y2 - y1)]})
             if "contexte" in images[gid]:
                 z.writestr(f"{gid}/contexte.jpg", images[gid]["contexte"])
@@ -375,12 +451,21 @@ def schema_reponse(coarse, k, prompt):
         props["box_covers"] = {"enum": COUVERTURE}
     if coarse == "vehicle":
         props["fine_class"] = {"enum": [c for c, _ in CLASSES_VEHICULE]}
+    if coarse == "vehicle" or prompt not in ("p1", "p2", "p3"):
         props["affiliation"] = {"enum": AFFILIATIONS}
+    if prompt in ("p5", "p6", "p7"):  # entier ou partie avant « objet réel »
+        ordre = ["appearance", "description", "same_object", "different_views",
+                 "box_covers", "real_object", "fine_class", "affiliation"]
+        props = {k: props[k] for k in ordre if k in props}
     return {"type": "object", "properties": props,
             "required": list(props), "additionalProperties": False}
 
 
 def texte_question(coarse, prompt):
+    if prompt == "p4":
+        return texte_question_p4(coarse)
+    if prompt in ("p5", "p6", "p7"):
+        return texte_question_p5(coarse)
     objet = "vehicle" if coarse == "vehicle" else "person"
     lignes = ["Answer with a JSON object:"]
     if prompt == "p1":
@@ -437,7 +522,136 @@ def texte_question(coarse, prompt):
     return "\n".join(lignes)
 
 
-def construire_messages(z, gid, prompt):
+def texte_question_p4(coarse):
+    objet = "vehicle" if coarse == "vehicle" else "person"
+    lignes = [
+        "Answer with a JSON object:",
+        '- "appearance": describe only what is inside the red rectangle in '
+        "the close-up views: shape, colours, size compared with nearby "
+        "things, shadow. Do not name the object yet.",
+        '- "description": one short sentence saying what the object in the '
+        "red rectangle most likely is, given its appearance.",
+        '- "same_object": "yes" if every view shows the same physical object; '
+        '"no" if in some views the red rectangle is on a different object '
+        "(another vehicle or person, or background). Changes of scale, viewing "
+        "angle, blur, lighting or partial occlusion of the same object are "
+        'normal and do not count as a change of object; "unsure" if you '
+        "cannot tell.",
+        '- "different_views": the numbers of the views whose red rectangle is '
+        "not on the object seen in most views (empty list if none).",
+        f'- "real_object": "yes" if the object in the red rectangle (in most '
+        f'views) is a {objet} or a part of one; "no" if it is something else, '
+        f'for example {NON_OBJETS_P4[coarse]}; "unsure" if it cannot be '
+        "decided.",
+        '- "box_covers": "whole" if the red rectangle covers the whole visible '
+        f'object; "part" if it covers only a part of a larger {objet} whose '
+        "rest is clearly visible just outside the rectangle ("
+        f'{PARTIES_P4[coarse]}); "unsure" if you cannot tell. An object partly '
+        "hidden by trees, another object or the image border is \"whole\" "
+        "when the rectangle covers all of its visible part.",
+    ]
+    if coarse == "vehicle":
+        lignes.append('- "fine_class": the type of the whole vehicle (also when '
+                      "the box covers only a part of it), one of:")
+        lignes += [f"    {c}: {d};" for c, d in CLASSES_VEHICULE_P4]
+        lignes += [
+            "  Military paint (matte olive green, khaki, sand or camouflage) or "
+            "military markings make a vehicle military whatever its shape: a "
+            "military car or 4x4 is mil_other, not car.",
+            "  If it is not a vehicle, still give the closest type: "
+            '"real_object" carries the rejection.',
+            '- "affiliation": "military" if the vehicle has military paint or '
+            'markings or is a military type; "civil" if it is a civilian '
+            'vehicle; "unknown" if you cannot tell.',
+        ]
+    else:
+        lignes.append(
+            '- "affiliation": "military" if the person wears a uniform, '
+            "camouflage, a helmet or a plate carrier, or carries a weapon; "
+            '"civil" if the clothing is visible and civilian; "unknown" if '
+            "you cannot tell.")
+    return "\n".join(lignes)
+
+
+def texte_question_p5(coarse):
+    objet = "vehicle" if coarse == "vehicle" else "person"
+    lignes = [
+        "Answer with a JSON object:",
+        '- "appearance": describe only what is inside the red rectangle in '
+        "the close-up views: shape, colours, size compared with nearby "
+        "things, shadow. Do not name the object yet.",
+        '- "description": one short sentence saying what the object in the '
+        "red rectangle most likely is, given its appearance.",
+        '- "same_object": "yes" if every view shows the same physical object; '
+        '"no" if in some views the red rectangle is on a different object '
+        "(another vehicle or person, or background). Changes of scale, viewing "
+        "angle, blur, lighting or partial occlusion of the same object are "
+        'normal and do not count as a change of object; "unsure" if you '
+        "cannot tell.",
+        '- "different_views": the numbers of the views whose red rectangle is '
+        "not on the object seen in most views (empty list if none).",
+        '- "box_covers": "whole" if the red rectangle covers the whole visible '
+        f'object; "part" if it covers only a part of a larger {objet} whose '
+        "rest is clearly visible just outside the rectangle "
+        f'({PARTIES_P5[coarse]}); "unsure" if you cannot tell. An object partly '
+        "hidden by trees, another object or the image border is \"whole\" "
+        "when the rectangle covers all of its visible part.",
+        f'- "real_object": "yes" if the object in the red rectangle (in most '
+        f'views) is a {objet}, or a part of one: a rectangle on a part of a '
+        f'{objet} is still "yes". "no" if it is something else '
+        f'({NON_OBJETS_P5[coarse]}, ...); "unsure" if it cannot be decided.',
+    ]
+    if coarse == "vehicle":
+        lignes.append('- "fine_class": the type of the whole vehicle (also when '
+                      "the rectangle covers only a part of it), one of:")
+        lignes += [f"    {c}: {d};" for c, d in CLASSES_VEHICULE_P5]
+        lignes += [
+            "  Military paint (matte olive green, khaki, sand or camouflage) or "
+            "military markings make a vehicle military whatever its shape: a "
+            "military car or 4x4 is mil_other, not car.",
+            "  If it is not a vehicle, still give the closest type: "
+            '"real_object" carries the rejection.',
+            '- "affiliation": "military" if the vehicle has military paint or '
+            'markings or is a military type; "civil" if it is a civilian '
+            'vehicle; "unknown" if you cannot tell.',
+        ]
+    else:
+        lignes.append(
+            '- "affiliation": "military" if the person wears a uniform, '
+            "camouflage, a helmet or a plate carrier, or carries a weapon; "
+            '"civil" if none of these is visible; "unknown" only if the person '
+            "is too small or blurred to see the clothing.")
+    return "\n".join(lignes)
+
+
+def taille_piste_m(telemetrie, meta):
+    """Médiane des largeurs au sol (m) des vues de la piste, ou None."""
+    largeurs = [largeur_sol_m(telemetrie[v["i"]], v["bbox"])
+                for v in meta["vues"] if v["i"] in telemetrie]
+    largeurs = [x for x in largeurs if x]
+    return float(np.median(largeurs)) if largeurs else None
+
+
+def phrase_taille(taille_m, prompt="p6"):
+    arrondi = round(taille_m, 1) if taille_m < 3 else round(taille_m)
+    if prompt == "p7":
+        return (f"Scale: from the drone altitude and camera angle, the tracked "
+                f"box is roughly {arrondi:g} m wide on the ground (a car is "
+                "about 1.8 m wide and 4.5 m long, a truck about 2.5 m wide and "
+                "10 m long). A box on a partly hidden vehicle or on a part of "
+                "one is smaller than the vehicle. ")
+    return (f"From the drone altitude and camera angle, the tracked box is "
+            f"about {arrondi:g} m wide on the ground (rough estimate, can be "
+            "off by half). For scale, seen from above: a person is about 0.5 m "
+            "wide, a car about 1.8 m wide and 4.5 m long, a van 2 m by 5 m, a "
+            "truck 2.5 m by 8 to 12 m, a bus 2.5 m by 12 m. The box can be "
+            "smaller than the object when the object is partly hidden (trees, "
+            "another vehicle, image border) or when the box covers only a part "
+            "of it: use the size as a hint, never as the only reason to reject "
+            "an object. ")
+
+
+def construire_messages(z, gid, prompt, telemetrie=None):
     meta = json.loads(z.read(f"{gid}/meta.json"))
     coarse, vues = meta["coarse"], meta["vues"]
     objet = "vehicle" if coarse == "vehicle" else "person"
@@ -465,6 +679,11 @@ def construire_messages(z, gid, prompt):
                        f"{meta['vue_contexte']} (same red rectangle), only to "
                        "understand the surroundings; judge the object itself from "
                        "the close-up views:")
+    if (prompt in PROMPTS_TAILLE and telemetrie is not None
+            and (prompt != "p7" or coarse == "vehicle")):
+        taille = taille_piste_m(telemetrie, meta)
+        if taille is not None:
+            fin_intro += " " + phrase_taille(taille, prompt).rstrip()
     contenu = [{"type": "text", "text": intro + fin_intro}]
     for v in vues:
         w, h = v["taille_px"]
@@ -588,8 +807,9 @@ def depouiller(reponse, coarse):
          "real_object": proba_options(lp, "real_object", OUI_NON)}
     if "box_covers" in sortie["reponse"]:
         p["box_covers"] = proba_options(lp, "box_covers", COUVERTURE)
-    if coarse == "vehicle":
+    if "affiliation" in sortie["reponse"]:
         p["affiliation"] = proba_options(lp, "affiliation", AFFILIATIONS)
+    if coarse == "vehicle":
         p["fine_class"] = proba_valeur(lp, "fine_class")
     sortie["p"] = p
     return sortie
@@ -615,11 +835,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vues-seules", action="store_true",
                     help="préparer les vues sans interroger le serveur")
-    ap.add_argument("--serveur", default=None,
+    ap.add_argument("--serveur", nargs="+", default=None,
                     help="http://localhost:<port>/v1 (tunnel SSH)")
     ap.add_argument("--mode", choices=sorted(MODES), default="rapide")
     ap.add_argument("--prompt", choices=sorted(VUES_PROMPT), default="p2")
-    ap.add_argument("--paralleles", type=int, default=16)
+    ap.add_argument("--paralleles", type=int, default=16,
+                    help="requêtes simultanées par serveur")
     ap.add_argument("--limite", type=int, default=None,
                     help="au plus N pistes interrogées (essai)")
     args = ap.parse_args()
@@ -653,8 +874,13 @@ def main():
         raise SystemExit("[!] --serveur requis (ou --vues-seules)")
 
     import requests
-    serveur = args.serveur.rstrip("/")
-    modele = requests.get(f"{serveur}/models", timeout=30).json()["data"][0]["id"]
+    # plusieurs serveurs (un par GPU) : pistes réparties par group_id
+    serveurs = [u.rstrip("/") for u in args.serveur]
+    modeles = {requests.get(f"{u}/models", timeout=30).json()["data"][0]["id"]
+               for u in serveurs}
+    if len(modeles) != 1:
+        raise SystemExit(f"[!] modèles différents selon les serveurs : {modeles}")
+    modele = modeles.pop()
     sortie = dossier / f"{args.vol}_vlm_{args.mode}_{args.prompt}.jsonl"
     faites = set()
     if sortie.exists():
@@ -674,11 +900,13 @@ def main():
     connus = CAS_CONNUS.get(args.vol, {})
     parties = PARTIES.get(args.vol, {})
     contenues = contenance(pistes)
+    telemetrie = telemetrie_index(chemins["index"])
 
     def une(p):
         gid = p["group_id"]
         with zverrou:
-            messages, schema = construire_messages(zf, gid, args.prompt)
+            messages, schema = construire_messages(zf, gid, args.prompt,
+                                                   telemetrie)
         ligne = {"vol": args.vol, "group_id": gid, "coarse": p["coarse"],
                  "label_sam3": p["label"], "labels_sam3": p["labels"],
                  "n_detected": p["n_detected"],
@@ -695,7 +923,8 @@ def main():
             ligne["attendu"] = {"real_object": "oui", "pure": None,
                                 "partie": True, "note": parties[gid]}
         try:
-            rep, duree = interroger(serveur, modele, args.mode, messages,
+            rep, duree = interroger(serveurs[gid % len(serveurs)], modele,
+                                    args.mode, messages,
                                     schema, seed=gid)
             ligne.update(depouiller(rep, p["coarse"]))
             ligne["latence_s"] = round(duree, 2)
@@ -705,7 +934,7 @@ def main():
 
     t0, n, erreurs = time.time(), 0, 0
     with open(sortie, "a", encoding="utf-8") as fh, \
-            ThreadPoolExecutor(args.paralleles) as pool:
+            ThreadPoolExecutor(args.paralleles * len(serveurs)) as pool:
         for fut in as_completed([pool.submit(une, p) for p in a_faire]):
             ligne = fut.result()
             n += 1

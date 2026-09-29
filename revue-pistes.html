@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Revue des pistes</title>
+<style>
+  :root { --fond: #f6f6f4; --carte: #fff; --texte: #1d1d1b; --doux: #6b6b66;
+          --bord: #d9d9d4; --choix: #1f5fbf; --faux: #c62828; --ok: #2e7d32; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--fond);
+         color: var(--texte); }
+  header { position: sticky; top: 0; z-index: 2; background: var(--carte);
+           border-bottom: 1px solid var(--bord); padding: 8px 16px;
+           display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header b { font-size: 16px; }
+  .barre { flex: 1; min-width: 160px; height: 8px; background: var(--bord);
+           border-radius: 4px; overflow: hidden; }
+  .barre div { height: 100%; width: 0; background: var(--ok); }
+  button { font: inherit; border: 1px solid var(--bord); background: var(--carte);
+           border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { border-color: var(--choix); }
+  button.on { background: var(--choix); border-color: var(--choix); color: #fff; }
+  kbd { font: 11px ui-monospace, monospace; opacity: .65; margin-left: 4px; }
+  main { padding: 12px 16px 40px; display: grid; gap: 12px;
+         grid-template-columns: minmax(0, 1fr) 460px; }
+  @media (max-width: 1100px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .info { grid-column: 1 / -1; display: flex; gap: 16px; flex-wrap: wrap;
+          align-items: baseline; }
+  .info .gros { font-size: 18px; font-weight: 600; }
+  .info span { color: var(--doux); }
+  .vues { display: grid; gap: 8px;
+          grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+  figure { margin: 0; background: var(--carte); border: 3px solid transparent;
+           border-radius: 6px; padding: 3px; cursor: pointer; }
+  figure img { width: 100%; display: block; border-radius: 3px; }
+  figure.fausse { border-color: var(--faux); }
+  figure.fausse img { opacity: .55; }
+  figcaption { font-size: 12px; color: var(--doux); padding: 2px 2px 0; }
+  .contexte img { width: 100%; border-radius: 6px; display: block; }
+  .questions { grid-column: 1 / -1; display: grid; gap: 10px 24px;
+               grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); }
+  .q { background: var(--carte); border: 1px solid var(--bord); border-radius: 8px;
+       padding: 8px 10px; }
+  .q h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  .q .aide { color: var(--doux); font-size: 12px; margin: 4px 0 0; }
+  .q .boutons { display: flex; flex-wrap: wrap; gap: 5px; }
+  .q.inutile { opacity: .45; }
+  textarea { width: 100%; min-height: 54px; font: inherit; border: 1px solid var(--bord);
+             border-radius: 6px; padding: 6px; }
+  .etat { color: var(--doux); min-width: 110px; }
+  .sam3 { color: var(--faux); }
+  .grille { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px; }
+  .grille a { width: 14px; height: 14px; border-radius: 3px; background: var(--bord);
+              display: block; }
+  .grille a.faite { background: var(--ok); }
+  .grille a.ici { outline: 2px solid var(--choix); outline-offset: 1px; }
+  #loupe { position: fixed; inset: 0; background: rgba(0,0,0,.8); display: none;
+           align-items: center; justify-content: center; z-index: 5; }
+  #loupe img { width: min(90vh, 90vw); image-rendering: auto; }
+</style>
+</head>
+<body>
+<header>
+  <b>Revue des pistes</b>
+  <span id="compte"></span>
+  <div class="barre"><div id="avance"></div></div>
+  <button id="prec">◀<kbd>←</kbd></button>
+  <button id="suiv">▶<kbd>→ / Entrée</kbd></button>
+  <button id="nonfaite">prochaine non annotée<kbd>N</kbd></button>
+  <input id="aller" type="number" min="1" style="width:70px" title="aller au rang">
+  <span class="etat" id="etat"></span>
+</header>
+<main>
+  <div class="info" id="info"></div>
+  <div>
+    <div class="vues" id="vues"></div>
+    <p class="aide" style="color:var(--doux)">Clic sur une vue : la marquer comme
+      « pas sur le même objet ». Double-clic : agrandir.</p>
+  </div>
+  <div class="contexte" id="contexte"></div>
+  <div class="questions" id="questions"></div>
+  <div class="grille" id="grille"></div>
+</main>
+<div id="loupe"><img alt=""></div>
+<script>
+const NATURES = ["panneau", "poteau / pylône", "ombre", "végétation",
+  "bâtiment / structure", "cuve / conteneur / citerne", "marquage / sol",
+  "objet / débris", "animal", "autre classe", "autre"];
+const TOUCHES_CLASSE = "azertyuiopqs";
+let pistes = [], annots = {}, classes = [], ici = 0, voirSam3 = false, minuteur = null;
+
+const cle = p => `${p.vol}/${p.group_id}`;
+const el = (tag, attrs = {}, ...enfants) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null) e.setAttribute(k, v);
+  }
+  for (const c of enfants) e.append(c);
+  return e;
+};
+
+async function charger() {
+  const r = await (await fetch("/api/pistes")).json();
+  pistes = r.pistes; annots = r.annotations; classes = r.classes;
+  const premiere = pistes.findIndex(p => !(annots[cle(p)] || {}).real_object);
+  ici = premiere < 0 ? 0 : premiere;
+  afficher();
+}
+
+function courante() {
+  const p = pistes[ici];
+  if (!annots[cle(p)]) annots[cle(p)] = {vol: p.vol, group_id: p.group_id,
+    rang: p.rang, different_views: []};
+  return annots[cle(p)];
+}
+
+function enregistrer(tout_de_suite = true) {
+  clearTimeout(minuteur);
+  const a = courante();
+  const envoi = () => {
+    document.getElementById("etat").textContent = "enregistrement…";
+    fetch("/api/annotation", {method: "POST", body: JSON.stringify(a)})
+      .then(r => { if (!r.ok) throw r; document.getElementById("etat").textContent = "enregistré ✓"; majGrille(); })
+      .catch(() => { document.getElementById("etat").textContent = "⚠ NON enregistré"; });
+  };
+  if (tout_de_suite) envoi(); else minuteur = setTimeout(envoi, 700);
+}
+
+function poser(champ, valeur) {
+  const a = courante();
+  a[champ] = a[champ] === valeur ? null : valeur;
+  if (champ === "same_object" && a[champ] === "yes") a.different_views = [];
+  if (champ === "real_object" && a[champ] !== "no") a.nature = null;
+  enregistrer();
+  afficher();
+}
+
+function groupe(titre, champ, options, aide, inutile) {
+  const a = courante();
+  const boutons = options.map(([val, lib, touche]) => el("button", {
+    class: a[champ] === val ? "on" : "", title: lib,
+    onclick: () => poser(champ, val)}, lib, ...(touche ? [el("kbd", {}, touche)] : [])));
+  return el("div", {class: "q" + (inutile ? " inutile" : "")}, el("h3", {}, titre),
+    el("div", {class: "boutons"}, ...boutons), ...(aide ? [el("p", {class: "aide"}, aide)] : []));
+}
+
+function afficher() {
+  const p = pistes[ici], a = courante();
+  const nFaites = pistes.filter(q => (annots[cle(q)] || {}).real_object).length;
+  document.getElementById("compte").textContent = `${nFaites} / ${pistes.length} annotées`;
+  document.getElementById("avance").style.width = `${100 * nFaites / pistes.length}%`;
+  document.getElementById("etat").textContent = "";
+  const objet = p.coarse === "vehicle" ? "véhicule" : "personne";
+  document.getElementById("info").replaceChildren(
+    el("span", {class: "gros"}, `#${p.rang} — ${objet}`),
+    el("span", {}, `vol ${p.vol} · piste ${p.group_id}`),
+    el("span", {}, `${p.duree_s.toFixed(1)} s · ${p.n_detected} détections`),
+    el("span", {}, `taille médiane ${Math.round(p.size_median_px)} px · score moyen ${p.score_mean.toFixed(2)}`),
+    voirSam3
+      ? el("span", {class: "sam3"}, `SAM 3 : ${p.label} (${Object.entries(p.labels).map(([k, v]) => `${k} ${v}`).join(", ")}) · strate ${p.strate}`
+          + (p.contenue ? ` · contenue ${Math.round(100 * p.contenue)} % dans #${p.par}` : "")
+          + ` · échelle ×${p.echelle}`)
+      : el("button", {onclick: () => { voirSam3 = true; afficher(); }}, "voir le label SAM 3", el("kbd", {}, "L")));
+
+  const fausses = new Set(a.different_views || []);
+  document.getElementById("vues").replaceChildren(...p.vues.map(v => {
+    const img = el("img", {src: `/img/${p.vol}/${p.group_id}/${v.n}.jpg`, alt: `vue ${v.n}`});
+    return el("figure", {class: fausses.has(v.n) ? "fausse" : "",
+      onclick: () => basculerVue(v.n), ondblclick: e => { e.preventDefault(); loupe(img.src); }},
+      img, el("figcaption", {}, `vue ${v.n} · +${v.dt_s.toFixed(1)} s · ${v.taille_px[0]}×${v.taille_px[1]} px`));
+  }));
+  document.getElementById("contexte").replaceChildren(...(p.contexte ? [
+    el("img", {src: `/img/${p.vol}/${p.group_id}/contexte.jpg`, alt: "vue large",
+      ondblclick: e => loupe(e.target.src)}),
+    el("figcaption", {}, `vue large, au moment de la vue ${p.vue_contexte}`)] : []));
+
+  const nonReel = a.real_object === "no";
+  const qs = [
+    groupe(`Est-ce vraiment un(e) ${objet} (ou une partie) ?`, "real_object",
+      [["yes", "oui", "1"], ["no", "non", "2"], ["unsure", "incertain", "3"]],
+      "Sur les vues rapprochées, dans la plupart des vues."),
+  ];
+  if (nonReel) {
+    const autre = p.coarse === "vehicle" ? "personne" : "véhicule";
+    qs.push(el("div", {class: "q"}, el("h3", {}, "Alors, qu'est-ce ?"),
+      el("div", {class: "boutons"}, ...NATURES.map(n => {
+        const lib = n === "autre classe" ? autre : n;
+        return el("button", {class: a.nature === lib ? "on" : "", onclick: () => poser("nature", lib)}, lib);
+      }))));
+  }
+  qs.push(groupe("Même objet sur toutes les vues ?", "same_object",
+      [["yes", "oui", "4"], ["no", "non", "5"], ["unsure", "incertain", "6"]],
+      "Cliquer les vues qui ne sont pas sur l'objet majoritaire.", nonReel));
+  qs.push(groupe("La boîte couvre…", "box_covers",
+      [["whole", "l'objet entier", "7"], ["part", "une partie", "8"], ["unsure", "incertain", "9"]],
+      "Partie : cabine, avant, benne, roues, toit… d'un véhicule plus grand visible autour.", nonReel));
+  if (p.coarse === "vehicle") {
+    qs.push(groupe("Classe fine (du véhicule entier)", "fine_class",
+      classes.map(([c, d], i) => [c, c, TOUCHES_CLASSE[i]]), null, nonReel));
+    qs[qs.length - 1].querySelectorAll("button").forEach((b, i) => b.title = classes[i][1]);
+  }
+  qs.push(groupe("Affiliation", "affiliation",
+      [["civil", "civil", "C"], ["military", "militaire", "M"], ["unknown", "inconnue", "X"]],
+      p.coarse === "person" ? "Personne : civil ou militaire (tenue, arme)." : null, nonReel));
+  qs.push(groupe("Jugeable sur ces vues ?", "judgeable",
+      [["easy", "facile", "F"], ["hard", "difficile", "D"], ["impossible", "impossible", "G"]],
+      "Ce que le VLM reçoit : ces vues seulement."));
+  const zone = el("textarea", {placeholder: "commentaire (Échap pour sortir)"});
+  zone.value = a.comment || "";
+  zone.addEventListener("input", () => { courante().comment = zone.value; enregistrer(false); });
+  qs.push(el("div", {class: "q"}, el("h3", {}, "Commentaire"), zone));
+  document.getElementById("questions").replaceChildren(...qs);
+  majGrille();
+  document.getElementById("aller").value = p.rang;
+}
+
+function majGrille() {
+  document.getElementById("grille").replaceChildren(...pistes.map((q, i) => el("a", {
+    href: "#", title: `#${q.rang}`,
+    class: ((annots[cle(q)] || {}).real_object ? "faite" : "") + (i === ici ? " ici" : ""),
+    onclick: e => { e.preventDefault(); aller(i); }})));
+}
+
+function basculerVue(n) {
+  const a = courante();
+  const s = new Set(a.different_views || []);
+  s.has(n) ? s.delete(n) : s.add(n);
+  a.different_views = [...s].sort((x, y) => x - y);
+  if (s.size && a.same_object !== "unsure") a.same_object = "no";
+  enregistrer();
+  afficher();
+}
+
+function loupe(src) {
+  const l = document.getElementById("loupe");
+  l.querySelector("img").src = src;
+  l.style.display = "flex";
+}
+document.getElementById("loupe").onclick = e => e.currentTarget.style.display = "none";
+
+function aller(i) {
+  if (i < 0 || i >= pistes.length) return;
+  ici = i; voirSam3 = false; afficher(); window.scrollTo(0, 0);
+}
+document.getElementById("prec").onclick = () => aller(ici - 1);
+document.getElementById("suiv").onclick = () => aller(ici + 1);
+document.getElementById("nonfaite").onclick = prochaineNonFaite;
+document.getElementById("aller").onchange = e => aller(pistes.findIndex(p => p.rang === +e.target.value));
+
+function prochaineNonFaite() {
+  for (let k = 1; k <= pistes.length; k++) {
+    const i = (ici + k) % pistes.length;
+    if (!(annots[cle(pistes[i])] || {}).real_object) return aller(i);
+  }
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") {
+    if (e.key === "Escape") e.target.blur();
+    return;
+  }
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  const l = document.getElementById("loupe");
+  if (l.style.display === "flex") { l.style.display = "none"; return; }
+  const p = pistes[ici];
+  // chiffres par e.code : sur AZERTY, la rangée du haut donne & é " ' ( …
+  const chiffre = /^(Digit|Numpad)([1-9])$/.exec(e.code);
+  if (chiffre) {
+    const n = +chiffre[2];
+    const [champ, vals] = n <= 3 ? ["real_object", ["yes", "no", "unsure"]]
+      : n <= 6 ? ["same_object", ["yes", "no", "unsure"]]
+      : ["box_covers", ["whole", "part", "unsure"]];
+    poser(champ, vals[(n - 1) % 3]);
+    return e.preventDefault();
+  }
+  const k = e.key.toLowerCase();
+  if (e.key === "ArrowRight" || e.key === "Enter") return aller(ici + 1);
+  if (e.key === "ArrowLeft") return aller(ici - 1);
+  if (k === "n") return prochaineNonFaite();
+  if (k === "l") { voirSam3 = !voirSam3; return afficher(); }
+  const aff = {c: "civil", m: "military", x: "unknown"}[k];
+  if (aff) return poser("affiliation", aff);
+  const jug = {f: "easy", d: "hard", g: "impossible"}[k];
+  if (jug) return poser("judgeable", jug);
+  const ic = TOUCHES_CLASSE.indexOf(k);
+  if (p.coarse === "vehicle" && ic >= 0 && ic < classes.length) return poser("fine_class", classes[ic][0]);
+});
+
+charger();
+</script>
+</body>
+</html>

@@ -2,8 +2,10 @@
 
 Détections : tronçons JSONL du lot Slurm (`annots/<vol>/`), vidéo : piste 0
 (DefaultVideo) du MP4 source, décodée en streaming, rien n'est écrit sur
-disque. Les sorties vont en local dans `SORTIES/<vol>/`
-(`Datasets/real/AnafiUKR/pistes/`) ; les entrées ne sont jamais modifiées.
+disque. Les sorties vont en local dans `dossier_pistes(vol)`
+(`Datasets/real/AnafiUKR/pistes/<vol>/` pour 0000011, 0000012 et 0000018,
+`Datasets/real/CAMPAGNE3/pistes/<vol>/` pour les autres) ; les entrées ne sont
+jamais modifiées.
 Voir TRACKER-PISTES.md pour les formats.
 """
 from __future__ import annotations
@@ -24,9 +26,20 @@ import numpy as np
 # Entrées : détections du lot Slurm, index et vidéos, lus sans jamais être
 # modifiés ni supprimés.
 RACINE = Path("/media/users/cbarbier/annots-sam3")
-# Sorties (pistes, cache d'indices, rendus), en local : <SORTIES>/<vol>/.
+# Sorties (pistes, cache d'indices, rendus, vues VLM), en local : <SORTIES>/<vol>/
+# pour les 3 vols du lot AnafiUKR, <SORTIES_CAMPAGNE3>/<vol>/ pour les 16 autres
+# vols de CAMPAGNE3 (faits le 2026-09-25) ; voir dossier_pistes().
 SORTIES = Path("/home/cbarbier/Documents/Geolocalisation/Datasets/real/AnafiUKR"
                "/pistes")
+SORTIES_CAMPAGNE3 = Path("/home/cbarbier/Documents/Geolocalisation/Datasets/real"
+                         "/CAMPAGNE3/pistes")
+VOLS_ANAFIUKR = {"0000011", "0000012", "0000018"}
+# Vols RGB de jour, seuls gardés pour le VLM (consigne du 2026-09-29) : filmés
+# entre 05h33 et 17h08. Exclus, sans rien supprimer : les 9 vols de 22h48 à
+# 00h35 (0000229-0000236, 0000429, 0000431 : nuit, surtout IR) et 0000016
+# (export de la tablette, nuit, écran filmé).
+VOLS_JOUR = ("0000001", "0000002", "0000004", "0000005", "0000011", "0000012",
+             "0000018", "0000019", "0000231")
 
 
 @dataclass
@@ -45,6 +58,10 @@ class Frame:
     erreur: Optional[str] = None
 
 
+def dossier_pistes(vol: str) -> Path:
+    return (SORTIES if vol in VOLS_ANAFIUKR else SORTIES_CAMPAGNE3) / vol
+
+
 def chemins_vol(vol: str, racine: Path = RACINE) -> Dict[str, Path]:
     videos = sorted((racine / "campagne3_index").glob(f"*/{vol}_video.MP4"))
     if len(videos) != 1:
@@ -55,7 +72,7 @@ def chemins_vol(vol: str, racine: Path = RACINE) -> Dict[str, Path]:
         "video": videos[0],
         "index": (racine / "campagne3_index" / "annotation" / vol / "index"
                   / "samples_default.csv"),
-        "pistes": SORTIES / vol,
+        "pistes": dossier_pistes(vol),
     }
 
 
@@ -157,13 +174,51 @@ def ticks_index(index_csv: Path) -> Dict[int, int]:
                 for r in csv.DictReader(f) if r["stream"] == "default"}
 
 
+def timescale_index(index_csv: Path) -> int:
+    """Base de temps de l'index (celle du flux) : 30000, ou 90000 pour 0000016."""
+    with open(index_csv, newline="", encoding="utf-8") as f:
+        return int(next(csv.DictReader(f))["timescale"])
+
+
+def telemetrie_index(index_csv: Path) -> Dict[int, dict]:
+    """sample_index -> ligne de l'index (hauteur, champ de vue, assiette...)."""
+    with open(index_csv, newline="", encoding="utf-8") as f:
+        return {int(r["sample_index"]): r for r in csv.DictReader(f)
+                if r["stream"] == "default"}
+
+
+def largeur_sol_m(ligne: dict, bbox, largeur: int = 3840, hauteur: int = 2160,
+                  depression_min_deg: float = 3.0) -> Optional[float]:
+    """Largeur au sol (m) de la boîte, sol plat au niveau du décollage : rayon
+    du bas de la boîte (contact au sol), distance = hauteur relative /
+    sin(dépression). None si la télémétrie manque ou si le rayon est trop
+    rasant. Grossier : relief, roulis et distorsion ignorés ; sur les 134
+    pistes de la revue, personnes 0,3-1,4 m, voitures 2,4-4 m, camions 3-11 m.
+    """
+    import math
+    try:
+        h = float(ligne["rel_alt_m"])
+        hfov = math.radians(float(ligne["hfov_deg"]))
+        tangage = float(ligne["cam_pitch_deg"])
+    except (KeyError, ValueError):
+        return None
+    f = (largeur / 2) / math.tan(hfov / 2)
+    x1, _y1, x2, y2 = bbox
+    depression = math.radians(-tangage) + math.atan((y2 - hauteur / 2) / f)
+    if h < 2 or depression < math.radians(depression_min_deg):
+        return None
+    return (x2 - x1) * (h / math.sin(depression)) / f
+
+
 def decode_frames(video: Path, ticks: List[int], hwaccel: bool = True,
-                  saut_s: float = 4.0, timescale: int = 30000):
+                  saut_s: float = 4.0, timescale: Optional[int] = None):
     """Génère (position, image BGR ou None) pour chaque tick demandé, en ordre.
 
     Seek au keyframe précédent quand la prochaine frame demandée est à plus
     de `saut_s` secondes (trous IR), décodage continu sinon. Le flux 0 a une
     base de temps 1/timescale et pas de B-frames : `frame.pts == dts_ticks`.
+    timescale est celui du flux sauf s'il est imposé : 30000 pour la plupart
+    des vols, 90000 pour 0000016 (l'index suit le flux).
     None signale un tick absent du flux (ne devrait pas arriver).
     """
     import av
@@ -177,6 +232,8 @@ def decode_frames(video: Path, ticks: List[int], hwaccel: bool = True,
             pass
     conteneur = av.open(str(video), **options)
     flux = conteneur.streams.video[0]
+    if timescale is None:
+        timescale = flux.time_base.denominator
     if flux.time_base.numerator != 1 or flux.time_base.denominator != timescale:
         raise SystemExit(f"[!] base de temps {flux.time_base}, "
                          f"1/{timescale} attendu")

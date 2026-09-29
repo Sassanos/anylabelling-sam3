@@ -2,7 +2,7 @@
 """Pistes (group_id) d'un vol annoté par SAM 3 frame par frame : BoT-SORT hors ligne.
 
 Lit les tronçons JSONL du lot Slurm (`annots/<vol>/`, tous terminés), écrit
-une piste par ligne dans `Datasets/real/AnafiUKR/pistes/<vol>/<vol>_pistes_<tag>.jsonl`
+une piste par ligne dans `<dossier_pistes(vol)>/<vol>_pistes_<tag>.jsonl`
 (local) et le bilan dans le `.json` de même nom. Les détections ne sont jamais
 modifiées.
 
@@ -92,10 +92,14 @@ def calcule_indices(frames, video, encodeur, gmc_largeur, hwaccel,
             lot_lignes.clear()
             taille_lot = 0
 
+    # Les frames en erreur côté client (mur de corruption en fin de 0000004)
+    # n'ont ni détection ni image : ne pas les redemander au décodeur.
+    lisibles = [p for p, f in enumerate(frames) if not f.erreur]
     prec_gris, prec_sample = None, None
     t0 = dernier = time.time()
-    for pos, image in en_tache_de_fond(
-            decode_frames(video, [f.tick for f in frames], hwaccel)):
+    for k, image in en_tache_de_fond(
+            decode_frames(video, [frames[p].tick for p in lisibles], hwaccel)):
+        pos = lisibles[k]
         f = frames[pos]
         if image is None:
             manquantes += 1
@@ -291,7 +295,8 @@ def main():
     ap.add_argument("--vol", required=True)
     ap.add_argument("--racine", type=Path, default=RACINE)
     ap.add_argument("--sortie", type=Path, default=None,
-                    help="défaut : Datasets/real/AnafiUKR/pistes/<vol>/")
+                    help="défaut : dossier_pistes(vol), AnafiUKR/pistes/<vol>/ ou "
+                    "CAMPAGNE3/pistes/<vol>/")
     ap.add_argument("--indices", default=None,
                     help="dossier du cache d'indices (défaut : <sortie>/indices)")
     ap.add_argument("--tag", default=None,

@@ -1,6 +1,6 @@
 # Annotation SAM 3 / SAM 3.1 — état du chantier
 
-Notes de reprise. Dernière mise à jour : 2026-09-23.
+Notes de reprise. Dernière mise à jour : 2026-09-29.
 
 ## Ce qu'il y a ici
 
@@ -23,11 +23,13 @@ Notes de reprise. Dernière mise à jour : 2026-09-23.
 | `planche-controle.py` | planches visuelles : frames décodées en streaming + boîtes des JSONL (couleur par label) |
 | `slurm/` | déploiement cluster : jobs array, génération de tâches, bilan de lot — voir `slurm/README.md` |
 | `TRACKER-PISTES.md` | notes de reprise pour l'association des pistes (group_id) sur les JSONL du cluster |
-| `associe-pistes.py` | pistes (group_id) d'un vol entier, BoT-SORT hors ligne sur les JSONL du cluster → `Datasets/real/AnafiUKR/pistes/<vol>/` (local) |
+| `associe-pistes.py` | pistes (group_id) d'un vol entier, BoT-SORT hors ligne sur les JSONL du cluster → `Datasets/real/AnafiUKR/pistes/<vol>/` (0000011, 0000012, 0000018) ou `Datasets/real/CAMPAGNE3/pistes/<vol>/` (les 16 autres), en local |
 | `pistes_botsort.py`, `reid_osnet.py`, `pistes_io.py` | BoT-SORT réécrit (sans boxmot), descripteurs OSNet, lecture des tronçons et décodage NVDEC en streaming |
 | `rendu-pistes.py` | vidéo MP4 de contrôle des pistes (couleur et numéro par piste, recadrage auto) |
 | `planche-pistes.py` | planche par piste : une ligne de vignettes réparties sur sa durée (contrôle de pureté) |
 | `verifie-pistes-vlm.py` | vérification des pistes au VLM (Qwen3.8 servi par vLLM sur Slurm) : faux positifs, pureté, parties de véhicule, classe fine ; + contenance géométrique |
+| `revue-pistes.py`, `revue-pistes.html` | revue humaine de pistes tirées au hasard (strates), page locale d'annotation : vérité terrain pour les prompts |
+| `evalue-prompts-vlm.py` | un prompt du VLM contre la revue humaine : part réglage / part contrôle, désaccords |
 | `rapport-vlm-pistes.py`, `bilan-vlm-pistes.py` | pages HTML locales : une carte par piste (filtrable) / synthèse avec graphiques et galeries relues |
 | `poids/` | `osnet_x0_25_msmt17.pt` (zoo torchreid, 3 Mo) — **hors git** (`*.pt`) |
 | `SLURM_INSTRUCTIONS.md` | règles du cluster pour l'assistant — **HORS GIT** (ignoré, ne pas le committer) |
@@ -996,6 +998,85 @@ parallèles : ~3,5 h pour les ~16 500 pistes des trois vols, plus 20-40 min de v
 vol (décodage via le réseau depuis le PC ; faisable sur le cluster). Suite possible : lot
 complet en p3 ; attributs `vlm_*` écrits pour `Track Review` ; la pureté demande autre chose
 qu'un VLM qui regarde 8 vues (comparer vue à vue, ou couper aux zooms).
+
+## Revue humaine et prompt p5 — 2026-09-29
+
+### Pistes des 16 autres vols
+
+Les pistes des 16 vols CAMPAGNE3 hors lot AnafiUKR ont été faites le 2026-09-25
+(mêmes réglages, `botsort-54e109`) dans `Datasets/real/CAMPAGNE3/pistes/<vol>/` ;
+`pistes_io.dossier_pistes()` choisit le dossier selon le vol. 0000004 s'arrête avant
+le mur de corruption (`--fin 24067` ; `associe-pistes.py` ne redemande plus les frames
+en erreur au décodeur). **0000016 est le seul vol en base de temps 1/90000** (les autres
+1/30000) : `decode_frames` prend désormais celle du flux et `timescale_index()` celle de
+l'index ; 457 pistes.
+
+**Vols gardés pour le VLM : les 9 vols RGB de jour** (`VOLS_JOUR`, filmés de 05h33 à
+17h08). Exclus sans rien supprimer : les 9 vols de 22h48 à 00h35 (0000229-0000236,
+0000429, 0000431 : nuit, 70-85 % d'IR, vues sombres) et 0000016 (export de la tablette :
+écran filmé, nuit).
+
+### Revue humaine — `revue-pistes.py`
+
+200 pistes des 19 vols, tirées par strates (7 parties de véhicule par contenance
+géométrique, 5 zooms, puis par label SAM 3, rares sur-représentés : on cherche des
+échecs, pas des taux), diversifiées en vol, taille, longueur et score ; pistes déjà
+passées au VLM exclues. Page locale (`serveur`, http://127.0.0.1:8765) avec les vues
+mêmes du VLM (réglage p3), questions du VLM + nature des faux positifs et « jugeable
+sur ces vues ». Réponses : `Datasets/real/CAMPAGNE3/revue-vlm/annotations.jsonl`.
+
+Sur les 134 de jour, ce que la revue apprend :
+- faux positifs : **groupes électrogènes** (5, pris pour des `mil_*`), cuves, blocs de
+  béton, bidon, mallettes, chaises, sacs, poubelle, statue ;
+- **VT4** (4x4 militaire, base Ford Ranger) → `mil_other`, étiquetée car, van,
+  mil_truck ou mil_apc_ifv par SAM 3 ; moteur de GBC → `mil_truck` ;
+- **31 boîtes sur une partie** de véhicule (portière, coffre, moteur, roue).
+
+### Prompts — `evalue-prompts-vlm.py`
+
+Part réglage (85 pistes) pour lire les erreurs, part contrôle (49, rang multiple de 3)
+lue à la fin. Totaux sur les 134 :
+
+| | p3 | p4 | **p5** | p6 | p7 | SAM 3 |
+|---|---|---|---|---|---|---|
+| vrais véhicules gardés (71) | 65 | 57 | **67** | 64 | 64 | — |
+| faux positifs véhicule rejetés (29) | 19 | 23 | **21** | 22 | 22 | — |
+| parties trouvées (30) | 24 | 18 | **24** | 27 | 26 | — |
+| classe fine exacte (71) | 47 | 39 | **50** | 45 | 48 | 30 |
+| famille civil/militaire (71) | 63 | 65 | **64** | 64 | 66 | 60 |
+| vraies personnes gardées (24) | 21 | 21 | **23** | 20 | 23 | — |
+| pistes impures trouvées (7) | 2 | 2 | **2** | 2 | 2 | — |
+| affiliation des personnes (22) | — | 8 | **9** | 10 | 9 | — |
+
+1. **p4** (longue liste de leurres dont « electric generator or other equipment on
+   wheels ») : les morceaux de véhicule y tombent (portière, roue de secours, arrière de
+   VT4 → « un générateur ») et sont rejetés ; l'exemple Berlingo pousse les voitures
+   blanches en `van`. Nommer les groupes électrogènes n'en fait rejeter aucun.
+2. **p5, retenu** = p3 + `box_covers` demandé **avant** `real_object` et « une boîte sur
+   une partie reste yes », leurres concrets sans « équipement », VT4/GBC et « la peinture
+   militaire rend militaire », affiliation des personnes. Meilleur sur la part contrôle.
+3. **p6/p7 : largeur au sol** (`largeur_sol_m` : rayon du bas de la boîte, sol plat,
+   hauteur relative, tangage, champ de vue). Ordres de grandeur justes (personnes
+   0,3-1,4 m, voitures 2,4-4 m, camions 3-11 m, bidon 0,5 m, statue 2,9 m), mais pas de
+   gain net : un faux positif de plus, trois vrais véhicules de moins — tout texte ajouté
+   attire le rejet (véhicules pris pour « un arbre », « un oiseau »). Occlusions et
+   personnes vues à la verticale faussent la lecture de la taille.
+4. Restent faibles : pureté, affiliation des personnes (« unknown »), groupes
+   électrogènes remorqués, VT4 vue comme un SUV civil sombre.
+
+### Lot complet
+
+p5 sur toutes les pistes (≥ 5 détections) des 9 vols de jour : **41 544 pistes**.
+Vues d'abord (PC, ~26 frames/s décodées, 2-3 h), vol par vol, le VLM suit. `--serveur`
+accepte plusieurs URL (un serveur vLLM par GPU, pistes réparties par `group_id`) ;
+~1,1 piste/s par A100 à 32 requêtes.
+
+```bash
+PY=X-AnyLabeling-Server/.venv/bin/python
+$PY verifie-pistes-vlm.py --vol 0000019 --selection toutes --prompt p5 --vues-seules
+$PY verifie-pistes-vlm.py --vol 0000019 --selection toutes --prompt p5 \
+    --serveur http://localhost:13863/v1 http://localhost:13864/v1 --paralleles 32
+```
 
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
