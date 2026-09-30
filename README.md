@@ -1081,6 +1081,102 @@ $PY verifie-pistes-vlm.py --vol 0000019 --selection toutes --prompt p5 \
     --serveur http://localhost:13863/v1 http://localhost:13864/v1 --paralleles 32
 ```
 
+## Jeu de détection 3 classes — `exporte-detection.py`, 2026-09-30
+
+But : fine-tuner un YOLO Ultralytics (déjà entraîné sur les jeux publics de
+`Datasets/opensource`, cf. `ENTRAINEMENT.md`) avec une **tête à 3 classes** :
+`person`, `civilian_vehicle`, `military_vehicle`. Sortie :
+`Datasets/real/CAMPAGNE3/detection-p5/` (hors git).
+
+```
+frames/<vol>/<vol>_rgb_<sample:07d>.jpg   frames 4K intactes (JPEG q95)
+par-vol/<vol>.json                        toutes les boîtes, niveaux et raisons
+annotations/{train,val,test}.json         COCO pivot, coordonnées 4K
+yolo/{images,labels}/<split>/, data.yaml  tuiles 1024, zones ignorées grisées
+dataset.json  bilan.json  controle.html
+```
+
+**Trois niveaux par boîte**, verdicts du VLM par piste propagés à chaque frame :
+
+| Cas | Niveau |
+|---|---|
+| p5 `real_object` no (P ≥ 0,5) | retirer |
+| p5 `real_object` incertain, piste sans verdict | ignorer |
+| personne | garder `person` |
+| véhicule, `box_covers` part, contenu (≥ 80 % de l'aire) dans un véhicule ≥ 1,5× sur **cette** frame | retirer |
+| partie non contenue ; véhicule « entier » contenu dans un autre | ignorer |
+| `fine_class` civile | garder `civilian_vehicle` |
+| `vehicle_unknown` | ignorer |
+| `fine_class` militaire : m1 dit véhicule et pas civil | garder `military_vehicle` |
+| militaire : m1 dit équipement, ou civil, ou incertain | ignorer |
+| frame interpolée d'une piste gardée | ignorer |
+| shape SAM 3 hors piste (score ≥ 0,3, IoU < 0,5 avec les pistes) | ignorer |
+
+*Garder* : `iscrowd=0`. *Ignorer* : `iscrowd=1` en COCO (une annotation par catégorie
+neutralisée — pycocotools n'ignore une détection que dans la même catégorie — liées par
+`attributes.groupe_ignore`) et **zone grisée (114)** dans les tuiles YOLO, jamais sur une
+boîte gardée. *Retirer* : absent du COCO, compté dans `bilan.json`. `same_object` n'est
+pas utilisé : sur la revue, il écarterait 7 pistes pures pour 2 impures, et une piste
+impure garde des boîtes justes frame par frame.
+
+**m1, 2e passe sur les militaires** (`verifie-pistes-vlm.py --selection militaires
+--prompt m1`, mêmes vues que p5) : sur la revue, p5 ne garde juste que 4 « militaires »
+sur 10 — les 5 autres sont des **groupes électrogènes** remorqués. Question fermée
+« véhicule / équipement remorqué / autre » + « peinture militaire ». Revue : 5/5
+groupes électrogènes reconnus, mais le robot UGV et un VT4 vu de dessus pris pour des
+équipements, d'où *ignorer* et non *retirer*. Sur les 2 241 candidats (2 A100,
+15 min) : 180 militaires confirmés (8/12 justes à l'œil ; erreurs : cabines ou
+portières de camion, une voiture beige), 1 686 « équipement » (à l'œil, environ la
+moitié sont de vrais 4x4 militaires sous les arbres : m1 surappelle l'équipement),
+207 « civil ».
+
+**Résultat** (9 vols de jour, décodage ~5 frames/s écrites, 36 Go de frames) :
+
+| Vol | Split | Frames | person | civilian | military |
+|---|---|---|---|---|---|
+| 0000001 | train | 918 | 3 441 | 7 561 | 114 |
+| 0000002 | train | 1 294 | 10 774 | 5 524 | 179 |
+| 0000004 | train | 1 049 | 1 252 | 15 | 60 |
+| 0000011 | train | 1 115 | 2 735 | 6 026 | 240 |
+| 0000012 | train | 2 435 | 6 118 | 34 152 | 232 |
+| 0000019 | train | 2 600 | 4 948 | 77 751 | 1 143 |
+| 0000231 | train | 1 962 | 3 280 | 8 239 | 593 |
+| 0000005 | val | 1 327 | 2 327 | 787 | 247 |
+| 0000018 | test | 1 095 | 840 | 3 975 | 118 |
+
+Boîtes : 182 671 gardées ; ignorées : 26 227 interpolées, 17 054 « équipement » m1,
+11 814 hors piste, 10 835 parties, 7 165 entières contenues, 3 547 militaires
+incertaines, 3 519 affiliation inconnue, 2 263 objets incertains ; retirées : 62 411
+rejets du VLM, 7 714 parties contenues. Côté médian des boîtes gardées : 20 à 65 px pour
+les personnes, 19 à 145 px pour les civils selon le vol (0000012 et 0000019, filmés
+haut, sont les plus petits).
+
+**Tuiles YOLO** (1024 px, recouvrement 20 %, échelle ×1, 22 Go ; une boîte coupée est
+gardée si ≥ 40 % de son aire reste dans la tuile, sinon grisée comme un moignon ; tuile
+sans objet gardée avec une probabilité de 0,1). Validées par les chargeurs
+d'Ultralytics 8.4 (0 corrompue) :
+
+| Split | Tuiles | dont fond | person | civilian | military |
+|---|---|---|---|---|---|
+| train | 62 106 | 12 234 | 66 904 | 281 274 | 5 440 |
+| val | 5 023 | 1 627 | 5 033 | 1 681 | 572 |
+| test | 3 173 | 1 434 | 1 505 | 5 913 | 194 |
+
+**Limites connues** : les VT4 (voitures militaires sombres) sont presque toujours
+`car` pour le VLM, donc gardés en `civilian_vehicle` ; la classe militaire est
+petite ; les véhicules tronqués par le bord de l'image passent souvent pour des parties
+(ignorés). Aucune vérité terrain humaine : le test (0000018, vol test du jeu AnafiUKR)
+est en pseudo-labels, à relire.
+
+```bash
+PY=X-AnyLabeling-Server/.venv/bin/python
+$PY exporte-detection.py seuils              # règles contre la revue humaine (134 pistes)
+$PY exporte-detection.py vol 0000001 ...     # frames + par-vol/<vol>.json (reprise)
+$PY exporte-detection.py controle 0000001    # controle.html
+$PY exporte-detection.py assemble            # COCO, dataset.json, bilan.json
+$PY exporte-detection.py yolo                # tuiles 1024, recouvrement 20 %
+```
+
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
 Crête VRAM de propagation SAM 3.1 ~= `4,2 + 0,65 x detector_batch_size` Go.

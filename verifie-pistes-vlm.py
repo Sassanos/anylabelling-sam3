@@ -84,6 +84,11 @@ VUES_PROMPT["p6"] = VUES_PROMPT["p2"]
 # oiseau). Rien pour les personnes : vues à la verticale, seules la tête et
 # les épaules paraissent, le VLM y voyait un déchet (remarque utilisateur).
 VUES_PROMPT["p7"] = VUES_PROMPT["p2"]
+# m1 (2026-09-30) : 2e passe, seulement sur les pistes que p5 garde comme
+# véhicule militaire entier. Sur la revue humaine, 5 de ces 10 pistes étaient
+# des groupes électrogènes remorqués : une question fermée « véhicule ou
+# équipement remorqué », mêmes vues que p5.
+VUES_PROMPT["m1"] = VUES_PROMPT["p2"]
 PROMPTS_TAILLE = {"p6", "p7"}
 # Contenance géométrique (sans VLM) : une boîte véhicule est « contenue » sur
 # une frame quand >= 80 % de son aire tombe dans la boîte d'une autre piste
@@ -231,6 +236,8 @@ CLASSES_VEHICULE_P5 = [
 OUI_NON = ["yes", "no", "unsure"]
 COUVERTURE = ["whole", "part", "unsure"]
 AFFILIATIONS = ["civil", "military", "unknown"]
+MILITAIRES = {"mil_tank", "mil_apc_ifv", "mil_truck", "mil_other"}
+GENRES_M1 = ["vehicle", "towed_equipment", "other", "unsure"]
 
 SYSTEME = ("You check the output of an automatic object detector and tracker "
            "on aerial drone video. Judge only what is visible in the images.")
@@ -281,6 +288,23 @@ def selection_pilote(vol, pistes, seed=0):
 
 # --------------------------------------------------------------------------
 # Vues
+
+def candidats_militaires(dossier, vol, prompt="p5"):
+    """group_id des pistes que `prompt` garde comme véhicule militaire entier :
+    P(real_object=yes) >= 0,5, P(box_covers=part) < 0,5, fine_class militaire
+    (mêmes règles qu'exporte-detection.py)."""
+    gids = set()
+    for l in open(dossier / f"{vol}_vlm_rapide_{prompt}.jsonl", encoding="utf-8"):
+        r = json.loads(l)
+        rep, p = r.get("reponse"), r.get("p") or {}
+        if (not rep or r.get("erreur") or rep.get("fine_class") not in MILITAIRES
+                or not p.get("real_object") or not p.get("box_covers")):
+            continue
+        if (p["real_object"]["p"]["yes"] >= 0.5
+                and p["box_covers"]["p"]["part"] < 0.5):
+            gids.add(r["group_id"])
+    return gids
+
 
 def empreinte_vues(reglage):
     return hashlib.sha1(json.dumps(reglage, sort_keys=True).encode()).hexdigest()[:6]
@@ -436,6 +460,12 @@ def construire_vues(chemins, pistes, chemin_zip, reglage):
 # Questions
 
 def schema_reponse(coarse, k, prompt):
+    if prompt == "m1":
+        props = {"appearance": {"type": "string", "maxLength": 300},
+                 "kind": {"enum": GENRES_M1},
+                 "military": {"enum": OUI_NON}}
+        return {"type": "object", "properties": props,
+                "required": list(props), "additionalProperties": False}
     props = {}
     if prompt != "p1":
         props["appearance"] = {"type": "string", "maxLength": 300}
@@ -462,6 +492,8 @@ def schema_reponse(coarse, k, prompt):
 
 
 def texte_question(coarse, prompt):
+    if prompt == "m1":
+        return texte_question_m1()
     if prompt == "p4":
         return texte_question_p4(coarse)
     if prompt in ("p5", "p6", "p7"):
@@ -622,6 +654,31 @@ def texte_question_p5(coarse):
             '"civil" if none of these is visible; "unknown" only if the person '
             "is too small or blurred to see the clothing.")
     return "\n".join(lignes)
+
+
+def texte_question_m1():
+    return "\n".join([
+        "A first check classified the object in the red rectangle as a military "
+        "vehicle. Military sites also hold towed equipment that looks like a "
+        "small vehicle from above: electric generators, compressors, trailers, "
+        "field kitchens, boxes or shelters on wheels or skids.",
+        "Answer with a JSON object:",
+        '- "appearance": describe only what is inside the red rectangle in the '
+        "close-up views: overall shape, whether a cab, windscreen, side windows "
+        "or seats are visible, wheels or tracks, a drawbar or tow hitch, its "
+        "size compared with nearby cars or people. Do not name the object yet.",
+        '- "kind": "vehicle" if it is a self-propelled vehicle: car, 4x4, '
+        "pickup, truck, armoured vehicle, tank, or a small unmanned ground "
+        'robot; "towed_equipment" if it is a generator, compressor, trailer, '
+        "cart or other equipment without a cab or driver's position, meant to "
+        'be towed or set on the ground; "other" if it is something else '
+        '(container, tent, crate, part of a building, sign, ...); "unsure" if '
+        "you cannot tell. A rectangle on a part of a vehicle (door, rear, "
+        'cab) is still "vehicle".',
+        '- "military": "yes" if the object has military paint (matte olive '
+        "green, khaki, sand or camouflage) or markings, or is a military "
+        'type; "no" if it looks civilian; "unsure" if you cannot tell.',
+    ])
 
 
 def taille_piste_m(telemetrie, meta):
@@ -803,13 +860,16 @@ def depouiller(reponse, coarse):
     except ValueError:
         sortie["reponse"], sortie["brut"] = None, brut
         return sortie
-    p = {"same_object": proba_options(lp, "same_object", OUI_NON),
-         "real_object": proba_options(lp, "real_object", OUI_NON)}
+    p = {c: proba_options(lp, c, OUI_NON) for c in ("same_object", "real_object")
+         if c in sortie["reponse"]}
     if "box_covers" in sortie["reponse"]:
         p["box_covers"] = proba_options(lp, "box_covers", COUVERTURE)
     if "affiliation" in sortie["reponse"]:
         p["affiliation"] = proba_options(lp, "affiliation", AFFILIATIONS)
-    if coarse == "vehicle":
+    if "kind" in sortie["reponse"]:
+        p["kind"] = proba_options(lp, "kind", GENRES_M1)
+        p["military"] = proba_options(lp, "military", OUI_NON)
+    if "fine_class" in sortie["reponse"]:
         p["fine_class"] = proba_valeur(lp, "fine_class")
     sortie["p"] = p
     return sortie
@@ -824,10 +884,12 @@ def main():
     ap.add_argument("--racine", type=Path, default=RACINE)
     ap.add_argument("--pistes", type=Path, default=None,
                     help="jeu de pistes (défaut : le plus récent du vol)")
-    ap.add_argument("--selection", choices=["connus", "pilote", "toutes"],
+    ap.add_argument("--selection", choices=["connus", "pilote", "toutes",
+                                             "militaires"],
                     default="pilote",
                     help="connus : les cas relus (CAS_CONNUS) ; pilote : "
-                    "+ strates au hasard ; toutes : tout le vol")
+                    "+ strates au hasard ; toutes : tout le vol ; militaires : "
+                    "pistes gardées en véhicule militaire entier par p5 (m1)")
     ap.add_argument("--gid", type=int, nargs="+", default=None,
                     help="group_id précis (remplace --selection)")
     ap.add_argument("--min-len", type=int, default=5,
@@ -855,6 +917,9 @@ def main():
                                               **PARTIES.get(args.vol, {})}}
     elif args.selection == "pilote":
         categories = selection_pilote(args.vol, pistes, args.seed)
+    elif args.selection == "militaires":
+        mil = candidats_militaires(chemins["pistes"] / "vlm", args.vol)
+        categories = {g: ["militaire_p5"] for g in mil}
     else:
         categories = {p["group_id"]: ["toutes"] for p in pistes
                       if p["n_detected"] >= args.min_len}
@@ -864,7 +929,8 @@ def main():
     dossier = chemins["pistes"] / "vlm"
     reglage = VUES_PROMPT[args.prompt]
     chemin_zip = dossier / f"{jeu.stem}_vues-{empreinte_vues(reglage)}.zip"
-    manquantes = [p for p in retenues if p["group_id"] not in gids_du_zip(chemin_zip)]
+    deja = gids_du_zip(chemin_zip)   # une lecture : le zip compte 10 fichiers par piste
+    manquantes = [p for p in retenues if p["group_id"] not in deja]
     if manquantes:
         print(f"[i] vues à préparer : {len(manquantes)} pistes")
         construire_vues(chemins, manquantes, chemin_zip, reglage)
