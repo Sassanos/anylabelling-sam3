@@ -64,6 +64,8 @@ CIVILS = {"car", "van", "truck", "bus", "motorcycle", "bicycle", "agri_vehicle"}
 # Splits par vol, jamais par image. 0000018 : vol test du jeu AnafiUKR annoté
 # à la main (Datasets/real/AnafiUKR/annotation/splits.json).
 SPLITS = {"0000018": "test", "0000005": "val"}
+REVUE_MILITAIRES = Path("/home/cbarbier/Documents/Geolocalisation/Datasets/real"
+                        "/CAMPAGNE3/revue-militaires/annotations.jsonl")
 TELEMETRIE = ("rel_alt_m", "agl_m", "hfov_deg", "vfov_deg", "cam_pitch_deg",
               "lat", "lon")
 
@@ -81,6 +83,17 @@ REGLES = {
     "iou_shape_piste": 0.5,  # shape SAM 3 recouverte par une boîte de piste
     "score_hors_piste": 0.3,  # shapes hors piste plus faibles : ignorées du tout
     "interpolees": "ignorer",   # ou "garder"
+    # Recollage des véhicules coupés aux coutures des tuiles de SAM 3 tuilé
+    # (tuiles 1008, recouvrement 0,2 : .done des tronçons, configs/auto_labeling/
+    # segment_anything_3_tiled.yaml). La fusion SAHI garde la boîte au
+    # meilleur score, souvent le morceau d'une tuile plutôt que le véhicule
+    # entier de la passe pleine image : sur 0000001, 1 715 des 2 135 parties
+    # contenues et 13 % des boîtes gardées étaient coupées à une couture.
+    "recoller": True,
+    "tuile_sam3": 1008,
+    "recouvrement_sam3": 0.2,
+    "tol_couture": 8,          # px entre un bord de boîte et la couture
+    "iou_autre_axe": 0.5,      # recouvrement des deux morceaux sur l'autre axe
     "pas_s": 1.0,
     "pas_bonus_s": 1 / 3,
 }
@@ -105,21 +118,29 @@ def _p(v, champ, option):
     return None if not d else d["p"].get(option, 0.0)
 
 
-def verdict_piste(coarse, v5, vm1, regles=REGLES):
+def verdict_piste(coarse, v5, vm1, humain=None, regles=REGLES):
     """(niveau, catégorie ou groupe d'ignorance, raison, infos).
 
     niveau : garder | ignorer | retirer | partie (décidé frame par frame :
     retirée si contenue dans un véhicule entier, ignorée sinon).
+    humain : verdict de revue-militaires.py (militaire, civil, non,
+    incertain), qui remplace p5/m1 pour la famille du véhicule.
     """
     infos = {}
-    if v5 is None:
+    if humain == "non":
+        return "retirer", coarse, "humain_non", {"humain": humain}
+    if v5 is None and humain is None:
         return "ignorer", coarse, "sans_verdict", infos
+    if v5 is None:   # relue à la main sans verdict p5
+        v5 = {"reponse": {}, "p": {}}
     rep = v5["reponse"]
     p_non, p_oui = _p(v5, "real_object", "no"), _p(v5, "real_object", "yes")
     if p_non is None:   # logprobs illisibles : on prend la réponse
         p_non = 1.0 if rep.get("real_object") == "no" else 0.0
         p_oui = 1.0 if rep.get("real_object") == "yes" else 0.0
     infos.update(p_objet=round(p_oui, 3), fine_class=rep.get("fine_class"))
+    if humain in ("militaire", "civil", "incertain") and coarse == "vehicle":
+        p_non, p_oui = 0.0, 1.0   # la revue humaine dit « véhicule »
     if p_non >= regles["p_rejet"]:
         return "retirer", coarse, "rejet_vlm", infos
     if p_oui < regles["p_objet"]:
@@ -130,8 +151,16 @@ def verdict_piste(coarse, v5, vm1, regles=REGLES):
     if p_partie is None:
         p_partie = 1.0 if rep.get("box_covers") == "part" else 0.0
     infos["p_partie"] = round(p_partie, 3)
+    if humain:
+        infos["humain"] = humain
     if p_partie >= regles["p_partie"]:
         return "partie", "vehicle", "partie", infos
+    if humain == "militaire":
+        return "garder", "military_vehicle", "humain", infos
+    if humain == "civil":
+        return "garder", "civilian_vehicle", "humain", infos
+    if humain == "incertain":
+        return "ignorer", "vehicle", "humain_incertain", infos
     fine = rep.get("fine_class")
     if fine in vlm.MILITAIRES:
         if vm1 is None:
@@ -173,50 +202,119 @@ def _iou_matrice(a, b):
     return inter, aa, ab
 
 
+def debuts_tuiles(n, tuile, recouvrement):
+    """Débuts des tuiles sur un axe, comme get_slice_bboxes de SAHI (utilisé
+    par segment_anything_3_tiled) : pas de tuile - int(recouvrement * tuile),
+    dernière tuile recalée sur le bord."""
+    pas, x, d = tuile - int(recouvrement * tuile), 0, []
+    while x < n:
+        if x + tuile > n:
+            d.append(max(n - tuile, 0))
+            break
+        d.append(x)
+        x += pas
+    return d
+
+
+def coutures(n, tuile, recouvrement):
+    """[(début de la tuile i+1, fin de la tuile i)] : bandes de recouvrement."""
+    d = debuts_tuiles(n, tuile, recouvrement)
+    return [(d[i + 1], d[i] + tuile) for i in range(len(d) - 1)]
+
+
+def recoller(boites, largeur, hauteur, regles=REGLES):
+    """Groupes (listes d'indices, taille >= 2) de boîtes véhicule qui sont les
+    morceaux d'un même véhicule coupé par les coutures des tuiles SAM 3 : l'un
+    finit sur la fin de la tuile i, l'autre commence au début de la tuile
+    i+1, même étendue sur l'autre axe. Union-find : coins et véhicules à
+    cheval sur plusieurs coutures."""
+    t, r, tol = regles["tuile_sam3"], regles["recouvrement_sam3"], regles["tol_couture"]
+    b = np.asarray(boites, float).reshape(-1, 4)
+    parent = list(range(len(b)))
+
+    def racine(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for axe, n in ((0, largeur), (1, hauteur)):
+        lo, hi = b[:, axe], b[:, axe + 2]
+        olo, ohi = b[:, 1 - axe], b[:, 3 - axe]   # autre axe
+        for debut, fin in coutures(n, t, r):
+            gauche = np.where((np.abs(hi - fin) <= tol) & (lo < debut))[0]
+            droite = np.where((np.abs(lo - debut) <= tol) & (hi > fin))[0]
+            for i in gauche:
+                for j in droite:
+                    inter = min(ohi[i], ohi[j]) - max(olo[i], olo[j])
+                    union = max(ohi[i], ohi[j]) - min(olo[i], olo[j])
+                    if union > 0 and inter / union >= regles["iou_autre_axe"]:
+                        parent[racine(i)] = racine(j)
+    groupes = collections.defaultdict(list)
+    for i in range(len(b)):
+        groupes[racine(i)].append(i)
+    return [g for g in groupes.values() if len(g) >= 2]
+
+
+def famille(x):
+    """Famille d'un morceau : militaire vérifié, militaire non vérifié, civil,
+    ou None ; p5 donne la classe du véhicule entier même sur une partie."""
+    if x["niveau"] == "retirer" or x["source"] != "piste":
+        return None
+    if x["cat"] == "military_vehicle" or x.get("humain") == "militaire":
+        return "mil"
+    if x["cat"] == "civilian_vehicle" or x.get("humain") == "civil":
+        return "civ"
+    fine = x.get("fine_class")
+    if fine in vlm.MILITAIRES and x["raison"] not in ("equipement_m1",):
+        return "mil?"
+    if fine in CIVILS:
+        return "civ"
+    return None
+
+
+def verdict_recolle(morceaux):
+    """(niveau, cat, raison) d'un véhicule recollé, d'après ses morceaux,
+    pondérés par l'aire."""
+    if all(m["niveau"] == "retirer" for m in morceaux):
+        return "retirer", "vehicle", "rejet_vlm"
+    poids = collections.Counter()
+    for m in morceaux:
+        f = famille(m)
+        if f:
+            x1, y1, x2, y2 = m["bbox"]
+            poids[f] += (x2 - x1) * (y2 - y1)
+    mil, civ = poids["mil"] + poids["mil?"], poids["civ"]
+    if not mil and not civ:
+        return "ignorer", "vehicle", "recolle_inconnu"
+    if civ >= mil:
+        return "garder", "civilian_vehicle", "recolle"
+    if poids["mil"]:
+        return "garder", "military_vehicle", "recolle"
+    return "ignorer", "vehicle", "recolle_mil_non_verifie"
+
+
 def boites_frame(entrees, frame, regles=REGLES):
     """entrees : [(piste, entrée de frame, verdict)] des pistes présentes.
 
     Rend [{bbox, niveau, cat, raison, ...}] ; niveau garder | ignorer |
     retirer ; cat : catégorie gardée, ou « person » / « vehicle » pour une
-    boîte ignorée ou retirée.
+    boîte ignorée ou retirée. Étapes : boîtes des pistes et shapes hors
+    piste, recollage des véhicules coupés aux coutures des tuiles SAM 3,
+    contenance, puis niveaux des parties et des frames interpolées.
     """
-    sortie = []
-    # contenance frame par frame entre véhicules non rejetés
-    veh = [k for k, (p, _f, v) in enumerate(entrees)
-           if p["coarse"] == "vehicle" and v[0] != "retirer"]
-    contenue = set()
-    if len(veh) >= 2:
-        b = [entrees[k][1]["bbox"] for k in veh]
-        inter, aire, _ = _iou_matrice(b, b)
-        c = regles["contenance"]
-        m = ((inter / np.maximum(aire[:, None], 1) >= c["part_aire"])
-             & (aire[None, :] >= c["rapport"] * aire[:, None]))
-        np.fill_diagonal(m, False)
-        contenue = {veh[r] for r in np.where(m.any(1))[0]}
-    for k, (p, f, (niveau, cat, raison, infos)) in enumerate(entrees):
-        interpolee = bool(f.get("interpolated"))
-        if niveau == "partie":
-            if k in contenue:
-                niveau, raison = "retirer", "partie_contenue"
-            else:
-                niveau = "ignorer"
-        elif niveau == "garder" and p["coarse"] == "vehicle" and k in contenue:
-            niveau, cat, raison = "ignorer", "vehicle", "entier_contenu"
-        if (niveau == "garder" and interpolee
-                and regles["interpolees"] == "ignorer"):
-            niveau, raison = "ignorer", "interpolee"
-            cat = p["coarse"] if p["coarse"] == "person" else "vehicle"
-        sortie.append({"bbox": [round(float(x), 1) for x in f["bbox"]],
-                       "niveau": niveau, "cat": cat, "raison": raison,
-                       "source": "piste", "group_id": p["group_id"],
-                       "coarse": p["coarse"], "label_sam3": p["label"],
-                       "interpolated": interpolee, **infos})
+    items = []
+    for p, f, (niveau, cat, raison, infos) in entrees:
+        items.append({"bbox": [round(float(x), 1) for x in f["bbox"]],
+                      "niveau": niveau, "cat": cat, "raison": raison,
+                      "source": "piste", "group_id": p["group_id"],
+                      "coarse": p["coarse"], "label_sam3": p["label"],
+                      "interpolated": bool(f.get("interpolated")), **infos})
     # shapes SAM 3 hors de toute piste (pistes courtes, grappes non associées)
     if frame is not None and len(frame.boites):
-        pistes_b = [s["bbox"] for s in sortie]
         garde = frame.scores >= regles["score_hors_piste"]
-        if pistes_b:
-            inter, a, b = _iou_matrice(frame.boites, pistes_b)
+        if items:
+            inter, a, b = _iou_matrice(frame.boites, [x["bbox"] for x in items])
             iou = inter / np.maximum(a[:, None] + b[None, :] - inter, 1)
             garde &= iou.max(1) < regles["iou_shape_piste"]
         # doublons entre prompts : NMS simple entre shapes hors piste
@@ -232,13 +330,64 @@ def boites_frame(entrees, frame, regles=REGLES):
             retenues.append(int(j))
         for j in retenues:
             g = frame.grossieres[j]
-            sortie.append({"bbox": [round(float(x), 1) for x in frame.boites[j]],
-                           "niveau": "ignorer",
-                           "cat": "person" if g == "person" else "vehicle",
-                           "raison": "hors_piste", "source": "sam3",
-                           "coarse": g, "label_sam3": frame.labels[j],
-                           "score": round(float(frame.scores[j]), 3)})
-    return sortie
+            items.append({"bbox": [round(float(x), 1) for x in frame.boites[j]],
+                          "niveau": "ignorer",
+                          "cat": "person" if g == "person" else "vehicle",
+                          "raison": "hors_piste", "source": "sam3",
+                          "coarse": g, "label_sam3": frame.labels[j],
+                          "interpolated": False,
+                          "score": round(float(frame.scores[j]), 3)})
+    # recollage des véhicules coupés par les coutures des tuiles SAM 3
+    if regles["recoller"] and frame is not None:
+        veh = [k for k, x in enumerate(items)
+               if x["coarse"] == "vehicle" and not x["interpolated"]]
+        remplaces = set()
+        for g in recoller([items[k]["bbox"] for k in veh], frame.largeur,
+                          frame.hauteur, regles):
+            morceaux = [items[veh[i]] for i in g]
+            b = np.array([m["bbox"] for m in morceaux])
+            niveau, cat, raison = verdict_recolle(morceaux)
+            items.append({"bbox": [float(b[:, 0].min()), float(b[:, 1].min()),
+                                   float(b[:, 2].max()), float(b[:, 3].max())],
+                          "niveau": niveau, "cat": cat, "raison": raison,
+                          "source": "recolle", "coarse": "vehicle",
+                          "morceaux": [m.get("group_id") for m in morceaux],
+                          "label_sam3": morceaux[0]["label_sam3"],
+                          "fine_class": collections.Counter(
+                              m.get("fine_class") for m in morceaux
+                              if m.get("fine_class")).most_common(1)[0][0]
+                          if any(m.get("fine_class") for m in morceaux) else None,
+                          "interpolated": False})
+            remplaces.update(veh[i] for i in g)
+        items = [x for k, x in enumerate(items) if k not in remplaces]
+    # contenance frame par frame entre véhicules non rejetés
+    veh = [k for k, x in enumerate(items)
+           if x["coarse"] == "vehicle" and x["niveau"] != "retirer"]
+    contenue = set()
+    if len(veh) >= 2:
+        b = [items[k]["bbox"] for k in veh]
+        inter, aire, _ = _iou_matrice(b, b)
+        c = regles["contenance"]
+        m = ((inter / np.maximum(aire[:, None], 1) >= c["part_aire"])
+             & (aire[None, :] >= c["rapport"] * aire[:, None]))
+        np.fill_diagonal(m, False)
+        contenue = {veh[r] for r in np.where(m.any(1))[0]}
+    for k, x in enumerate(items):
+        if x["niveau"] == "partie":
+            if k in contenue:
+                x["niveau"], x["raison"] = "retirer", "partie_contenue"
+            else:
+                x["niveau"] = "ignorer"
+        elif x["niveau"] == "garder" and x["coarse"] == "vehicle" and k in contenue:
+            x["niveau"], x["cat"], x["raison"] = "ignorer", "vehicle", "entier_contenu"
+        elif (x["niveau"] == "ignorer" and x["source"] == "sam3"
+              and x["coarse"] == "vehicle" and k in contenue):
+            x["niveau"], x["raison"] = "retirer", "hors_piste_contenue"
+        if (x["niveau"] == "garder" and x["interpolated"]
+                and regles["interpolees"] == "ignorer"):
+            x["niveau"], x["raison"] = "ignorer", "interpolee"
+            x["cat"] = "person" if x["coarse"] == "person" else "vehicle"
+    return items
 
 
 # --------------------------------------------------------------------------
@@ -252,7 +401,13 @@ def charger_vol(vol):
     d = chemins["pistes"] / "vlm"
     v5 = lire_verdicts(d / f"{vol}_vlm_rapide_p5.jsonl")
     vm1 = lire_verdicts(d / f"{vol}_vlm_rapide_m1.jsonl")
-    return chemins, jeu, pistes, resume, v5, vm1
+    humain = {}
+    if REVUE_MILITAIRES.exists():
+        for l in open(REVUE_MILITAIRES, encoding="utf-8"):
+            r = json.loads(l)
+            if r["vol"] == vol:
+                humain[r["group_id"]] = r["verdict"]   # la dernière fait foi
+    return chemins, jeu, pistes, resume, v5, vm1, humain
 
 
 def choisir_frames(frames, par_frame, segments, regles=REGLES):
@@ -286,9 +441,10 @@ def cmd_vol(args):
     import cv2
     for vol in args.vols:
         t0 = time.time()
-        chemins, jeu, pistes, resume, v5, vm1 = charger_vol(vol)
+        chemins, jeu, pistes, resume, v5, vm1, humain = charger_vol(vol)
         verdicts = {p["group_id"]: verdict_piste(p["coarse"], v5.get(p["group_id"]),
-                                                 vm1.get(p["group_id"]))
+                                                 vm1.get(p["group_id"]),
+                                                 humain.get(p["group_id"]))
                     for p in pistes}
         par_frame = collections.defaultdict(list)
         for p in pistes:
@@ -297,7 +453,8 @@ def cmd_vol(args):
         frames, _src = charger_frames(chemins["annots"], vol)
         choisies = choisir_frames(frames, par_frame, resume["segments"])
         telem = telemetrie_index(chemins["index"])
-        print(f"[i] {vol} : {len(pistes)} pistes ({len(v5)} p5, {len(vm1)} m1), "
+        print(f"[i] {vol} : {len(pistes)} pistes ({len(v5)} p5, {len(vm1)} m1, "
+              f"{len(humain)} relues), "
               f"{len(frames)} frames annotées -> {len(choisies)} retenues",
               flush=True)
         images = []

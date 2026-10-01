@@ -1162,6 +1162,31 @@ d'Ultralytics 8.4 (0 corrompue) :
 | val | 5 023 | 1 627 | 5 033 | 1 681 | 572 |
 | test | 3 173 | 1 434 | 1 505 | 5 913 | 194 |
 
+**Véhicules gros et proches coupés : les coutures de SAM 3 tuilé.** Retour
+utilisateur sur `controle.html` (0000001, samples 1135 et 3035) : camionnettes et
+véhicule militaire ignorés. Cause : SAM 3 tuilé (tuiles 1008, recouvrement 0,2,
+coutures x = 807/1008, 1614/1815, 2421/2622, 2832/3429, y = 807/1008, 1152/1815) sort un
+véhicule plus gros qu'une tuile en morceaux coupés net aux coutures ; la passe pleine
+image le voit entier, mais la fusion SAHI (NMM en IOS, meilleur score) garde souvent le
+morceau. Sur 0000001 : 1 715 des 2 135 parties contenues et 13 % des boîtes gardées
+étaient coupées à une couture. **Recollage à l'export** (`recoller()`) : deux boîtes
+véhicule, l'une finissant sur la fin de la tuile i, l'autre commençant au début de la
+tuile i+1, même étendue sur l'autre axe (IoU ≥ 0,5), sont unies (union-find : coins,
+plusieurs coutures) ; famille votée à l'aire sur les verdicts des morceaux (p5 donne la
+classe du véhicule entier même sur une partie). 487 véhicules recollés gardés sur les 9
+vols. Limite : rien à recoller quand la fusion de SAM 3 n'a gardé qu'un morceau.
+
+**Revue humaine des militaires** — `revue-militaires.py` (http://127.0.0.1:8766) :
+Masstech pris pour un équipement par m1, VT4 vus civils, et « beaucoup de pistes
+ignorées sont en fait militaires ». Une piste à la fois (vues du VLM et vue large),
+clavier `m` militaire, `c` civil, `n` pas un véhicule, `i` incertain. 3 341 pistes des
+frames exportées, par priorité : militaires ignorés par m1 (1 908), affiliation ou objet
+incertain (739), militaires gardés par m1 (188), parties militaires (506). Réponses dans
+`Datasets/real/CAMPAGNE3/revue-militaires/annotations.jsonl` (la dernière fait foi) ;
+`exporte-detection.py` les lit et elles remplacent p5/m1 pour la famille (`non` →
+retirée). Au 2026-09-30 au soir : 564 relues (161 militaires, 204 civils, 188 pas un
+véhicule, 11 incertaines).
+
 **Limites connues** : les VT4 (voitures militaires sombres) sont presque toujours
 `car` pour le VLM, donc gardés en `civilian_vehicle` ; la classe militaire est
 petite ; les véhicules tronqués par le bord de l'image passent souvent pour des parties
