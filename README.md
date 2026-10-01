@@ -1202,6 +1202,86 @@ $PY exporte-detection.py assemble            # COCO, dataset.json, bilan.json
 $PY exporte-detection.py yolo                # tuiles 1024, recouvrement 20 %
 ```
 
+## Flux infrarouge — pilote et lot visible, 2026-10-01
+
+But : annoter la piste thermique (640×512, 16 bits, 8,57 fps) comme le RGB, mêmes trois
+classes, d'abord sur AnafiUKR (0000011, 0000012, 0000018), puis sur CAMPAGNE3.
+
+**Ce qu'il y a.** ~101 000 frames thermiques : ~25 800 de jour (0000004, 0000005,
+0000011, 0000012, 0000018, 0000019, 0000231), ~75 600 de nuit (0000229, 0000230,
+0000233 à 0000236, 0000429, 0000431). Pendant une rafale thermique, le RGB est dans une
+piste à part, `VisibleVideo` (flux 1, 4K, 8,57 fps) ; le lot Slurm de septembre n'a
+annoté que `DefaultVideo` hors rafale. Sur les trois vols AnafiUKR, aucune des 14 321
+frames visibles n'est à moins de 50 ms d'une frame déjà annotée.
+
+**Recalage RGB → IR.** Le champ thermique n'est pas dans la télémétrie ; mesuré : **32°**
+(celui du visible, `hfov_deg`, va de 2,5° à 74,6° selon le zoom). `u_ir = x_rgb / s − ox`
+avec `s = f_rgb / f_ir` (2,26 px RGB par px IR au plus large) et un décalage trouvé par
+corrélation des gradients, bornée à ±60 px autour de l'axe : stable à ±2 px sur un vol.
+Les boîtes du visible projetées tombent sur les objets dans l'IR. Visible zoomé sous
+32° : il ne couvre qu'une partie de l'image thermique.
+
+**SAM 3 directement sur l'IR** (36 paires de jour de 0000011 ; référence = boîtes SAM 3
+tuilé du visible apparié, projetées, IoU ≥ 0,3 ; pas une vérité terrain : elle contient
+des ombres étiquetées `person`) :
+
+| Réglage | retrouvées | véhicules | personnes | s/frame (PC) |
+|---|---|---|---|---|
+| plein cadre | 41/120 | 37/78 | 4/42 | 1,0 |
+| tuiles 320 px + plein cadre | 52/120 | 45/78 | 7/42 | 7,1 |
+| tuiles 224 px + plein cadre | 52/120 | 44/78 | 8/42 | 13,2 |
+
+De jour les objets font ~13 px dans l'IR : le direct en rate la moitié, d'où le transfert
+depuis le visible. De nuit (24 frames de 4 vols) le visible est noir, les vols sont plus
+bas : voitures à 0,9, personnes à 0,77, un véhicule bâché raté, une tache chaude prise
+pour une personne. Page et scripts du pilote : `Datasets/real/AnafiUKR/ir-pilote/`.
+
+**Plan.** Jour : chaîne RGB sur `VisibleVideo` (SAM 3 tuilé → pistes → VLM p5), projection
+dans l'IR, SAM 3 direct sur l'IR en complément, zones IR hors du champ visible ignorées.
+Nuit : SAM 3 direct sur l'IR → pistes → VLM sur vignettes thermiques (non testé).
+
+**Outils.**
+
+```bash
+# tâches et lot sur le flux visible (sorties à part : mêmes noms de tronçons)
+python3 slurm/genere-taches.py --flights-root campagne3_index --stream visible \
+    --chunk-size 1250 --flights 0000011 0000012 0000018 --out slurm/tasks-visible-anafiukr.json
+sbatch --job-name=annots-vis --array=0-11%4 \
+    --export=ALL,ANNOTS_TASKS_FILE=$PWD/slurm/tasks-visible-anafiukr.json,ANNOTS_OUT_ROOT=$PWD/annots-visible \
+    slurm/annots-sam3.sbatch
+# piste thermique brute (lecture par offset, destripage, PNG 8 bits), tuiles 320
+python3 slurm/genere-taches.py ... --stream thermal --tile-size 320 --out slurm/tasks-thermal.json
+# pistes, rendus, planches, VLM sur le flux visible : sorties dans pistes-visible/<vol>/
+PISTES_FLUX=visible $PY associe-pistes.py --vol 0000011
+```
+
+- `annote-video-sam3.py --stream visible|thermal` ; la tâche porte `stream` et
+  `tile_size`. Stems `<vol>_vis_<ms>` et `<vol>_ir_<ms>`.
+- **Port du serveur : libre, demandé au système.** `12000 + tâche` tombait sur les vLLM
+  d'autres utilisateurs de gpu01 (12000, 12002), dont `/health` répond : la tâche 0 leur a
+  envoyé 5 frames (404) avant d'être annulée. Le sbatch vérifie aussi que son serveur vit.
+- `PISTES_FLUX=visible` (`pistes_io.py`) : `annots-visible/`, `samples_visible.csv`,
+  piste vidéo 1. Les `sample_index` du visible se suivent d'une rafale à l'autre : les
+  tronçons continus y sont coupés sur l'écart de temps (1 s).
+- **BoT-SORT tient à 8,57 fps.** UAVDT, vraies détections SAM 3, seuils 0,3/0,3 :
+
+  | cadence | pureté | morceaux / objet | couverture |
+  |---|---|---|---|
+  | 30 fps | 0,986 | 1,06 | 0,963 |
+  | 10 fps | 0,987 | 1,08 | 0,955 |
+  | 7,5 fps | 0,985 | 1,04 | 0,952 |
+
+**Lot visible AnafiUKR** (jobs 12910 et 12914, lancés le 2026-10-01) : 14 321 frames,
+12 tronçons de 1 250, ~6,9 s/frame sur H100, sorties
+`/media/users/cbarbier/annots-sam3/annots-visible/<vol>/`.
+
+**Lot thermique AnafiUKR** (job 12918, en file derrière le lot visible, `%4`) : SAM 3
+direct sur la piste thermique, tuiles 320, 13 907 frames en 7 tronçons de 2 500, sorties
+`annots-sam3/annots-thermal/<vol>/`.
+
+Le visible n'est annoté que sur les vols de jour : de nuit il est noir, seul le
+thermique direct a un sens.
+
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
 Crête VRAM de propagation SAM 3.1 ~= `4,2 + 0,65 x detector_batch_size` Go.

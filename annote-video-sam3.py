@@ -11,6 +11,20 @@ indique quelles frames du DefaultVideo sont du vrai RGB (mode=RGB, valid=1).
 Pendant les rafales thermiques, le DefaultVideo est un rendu d'affichage gelé
 qu'il ne faut pas annoter ; --all-frames court-circuite ce filtre (déconseillé).
 
+--stream visible annote à la place la piste VisibleVideo (piste vidéo 1, 4K,
+8,57 fps), qui n'existe que pendant ces rafales : c'est le RGB apparié au
+thermique. Index samples_visible.csv, frames valid=1 (les 30 premières sont
+figées), stems <vol>_vis_<ms>. À écrire dans un --out-dir distinct : les
+tronçons portent les mêmes noms que ceux du DefaultVideo.
+
+--stream thermal annote la piste ThermalVideo elle-même : samples bruts
+640x512 en 16 bits, lus à leur offset dans le MP4 (index samples_thermal.csv),
+rendus en 8 bits comme extract_ir.py (destripage colonne, étirement entre les
+centiles 0,5 et 99,5) et envoyés en PNG ; stems <vol>_ir_<ms>, bornes de
+l'étirement gardées (lo_dn, hi_dn). Les frames figées ou constantes sont
+écrites sans shapes avec "skipped". Tuiles de 320 px conseillées : les objets
+font ~13 px de jour.
+
 Découpage et reprise : un tronçon est une plage [--start, --end) de sample_index.
 La sortie <out-dir>/<flight>_chunk_<start>_<end>.jsonl est écrite
 incrémentalement (append + fsync périodique) et le marqueur .done n'est posé
@@ -76,6 +90,49 @@ def load_index(index_csv: Path):
     for r in rows:
         by_tick[int(r["dts_ticks"])] = r
     return rows, by_tick
+
+
+THERMAL_W, THERMAL_H = 640, 512
+THERMAL_FROZEN_DN = 0x8000
+
+
+def lit_thermique(f, row):
+    """Sample thermique brut (uint16) à son offset dans le MP4."""
+    import numpy as np
+    f.seek(int(row["offset_bytes"]))
+    buf = f.read(THERMAL_W * THERMAL_H * 2)
+    if len(buf) != THERMAL_W * THERMAL_H * 2:
+        raise RuntimeError("sample thermique tronqué")
+    return np.frombuffer(buf, dtype="<u2").reshape(THERMAL_H, THERMAL_W)
+
+
+def biais_colonnes(frame, smooth=31):
+    """Biais additif par colonne (thermal_destripe.column_offset du pipeline
+    AnafiUKR) : résidu d'un lissage horizontal, médiane le long des lignes."""
+    import cv2
+    import numpy as np
+    return np.median(frame - cv2.blur(frame, (smooth, 1)), axis=0)
+
+
+def clamp_destripage(f, rows, n=20, seuil=1.5, k=5.0):
+    """Borne du destripage estimée sur ~n frames du vol, comme extract_ir :
+    0 si les colonnes ne sont pas rayées (écart-type médian du biais <= seuil)."""
+    import numpy as np
+    ech = rows[:: max(1, len(rows) // n)][:n]
+    s = float(np.median([biais_colonnes(lit_thermique(f, r).astype(np.float32)).std()
+                         for r in ech]))
+    return (max(8.0, k * s) if s > seuil else 0.0), s
+
+
+def thermique_8bits(brute, clamp, p_lo=0.5, p_hi=99.5):
+    """(image uint8, lo, hi) : destripage borné puis étirement entre centiles."""
+    import numpy as np
+    f = brute.astype(np.float32)
+    if clamp:
+        f = f - np.clip(biais_colonnes(f), -clamp, clamp)[None, :]
+    lo, hi = np.percentile(f, [p_lo, p_hi])
+    hi = max(hi, lo + 1)
+    return np.clip((f - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8), float(lo), float(hi)
 
 
 def read_done(jsonl: Path, retry_errors: bool):
@@ -161,8 +218,12 @@ def main():
     ap.add_argument("--tile-match", type=float, default=0.5)
     ap.add_argument("--no-full-image", action="store_true",
                     help="tuilé : pas de passe plein cadre en plus des tuiles")
-    ap.add_argument("--stream-index", type=int, default=0,
-                    help="piste vidéo à décoder (0 = DefaultVideo)")
+    ap.add_argument("--stream", choices=("default", "visible", "thermal"), default="default",
+                    help="flux de l'index à annoter (visible = RGB des rafales thermiques, "
+                         "thermal = piste thermique brute)")
+    ap.add_argument("--stream-index", type=int, default=None,
+                    help="piste vidéo à décoder (défaut : 0 = DefaultVideo, "
+                         "1 = VisibleVideo avec --stream visible)")
     ap.add_argument("--jpeg-q", type=int, default=95)
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--retries", type=int, default=3)
@@ -184,6 +245,11 @@ def main():
         t = tasks[args.task_id]
         args.video, args.index = t["video"], t["index"]
         args.flight, args.start, args.end = t["flight"], t["start"], t["end"]
+        args.stream = t.get("stream", args.stream)
+        # réglage du lot porté par la tâche (le sbatch passe 1008 en dur)
+        args.tile_size = t.get("tile_size", args.tile_size)
+    if args.stream_index is None:
+        args.stream_index = 1 if args.stream == "visible" else 0
 
     if args.print_only:
         # État du tronçon sans serveur ni décodage (utilisé par le sbatch pour
@@ -200,10 +266,11 @@ def main():
     pmap, coarse = load_taxonomy(Path(args.taxonomy) if args.taxonomy else None)
 
     rows, by_tick = load_index(Path(args.index))
-    rows = [r for r in rows if r["stream"] == "default"]
+    rows = [r for r in rows if r["stream"] == args.stream]
     if not rows:
-        print("[!] index sans ligne stream=default", file=sys.stderr)
+        print(f"[!] index sans ligne stream={args.stream}", file=sys.stderr)
         return 2
+    by_tick = {int(r["dts_ticks"]): r for r in rows}
     timescale = int(rows[0]["timescale"])
 
     todo = []
@@ -213,7 +280,9 @@ def main():
             continue
         if args.end is not None and i >= args.end:
             continue
-        if not args.all_frames and (r.get("mode") != "RGB" or r.get("valid") != "1"):
+        # la colonne mode n'est renseignée que pour le DefaultVideo
+        if not args.all_frames and (r.get("valid") != "1" or (
+                args.stream == "default" and r.get("mode") != "RGB")):
             continue
         todo.append(int(r["dts_ticks"]))
     if not todo:
@@ -257,6 +326,7 @@ def main():
             "include_full_image": not args.no_full_image,
         })
 
+    prefixe = {"visible": "vis", "thermal": "ir"}.get(args.stream, "rgb")
     pending = sorted(pending)
     pending_set = set(pending)
     last = pending[-1]
@@ -277,12 +347,113 @@ def main():
     SEUIL_MUR = 12   # frames corrompues d'affilée -> le reste de la plage est
                      # présumé illisible (fin d'enregistrement endommagée)
 
+    def ecrit(rec):
+        nonlocal n_done, last_print
+        n_done += 1
+        out.write(json.dumps(rec, ensure_ascii=False).encode("utf-8") + b"\n")
+        if n_done % 25 == 0:
+            out.flush()
+            os.fsync(out.fileno())
+        now = time.time()
+        if now - last_print > 30:
+            el = now - t0
+            print(f"  {n_done}/{len(pending)} | {el:.0f}s | "
+                  f"{n_done / el:.2f} frames/s | {n_shapes} shapes | "
+                  f"{n_err} err", flush=True)
+            last_print = now
+        if n_err and args.max_errors and n_err >= args.max_errors:
+            print("[!] trop d'erreurs, abandon du tronçon", file=sys.stderr)
+            raise SystemExit(3)
+
+    def annote(img, row, tick, ext=".jpg", extra=None):
+        """Envoie une frame au serveur et écrit sa ligne JSONL."""
+        nonlocal n_shapes, n_err
+        h, w = img.shape[:2]
+        mime = "image/jpeg" if ext == ".jpg" else "image/png"
+        ok, buf = cv2.imencode(ext, img, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_q]
+                               if ext == ".jpg" else [])
+        if not ok:
+            rec_err = "erreur encodage image"
+        else:
+            b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            t_inf = time.time()
+            rec_err = None
+            body = None
+            for attempt in range(args.retries):
+                try:
+                    r = sess.post(
+                        f"{args.server}/v1/predict",
+                        json={"model": args.model,
+                              "image": f"data:{mime};base64,{b64}",
+                              "params": params},
+                        timeout=args.timeout)
+                    r.raise_for_status()
+                    body = r.json()
+                    if body.get("error"):
+                        rec_err = str(body)[:300]
+                        body = None
+                    break
+                except Exception as e:
+                    rec_err = str(e)[:300]
+                    if attempt < args.retries - 1:
+                        time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+            t_inf = time.time() - t_inf
+        if rec_err is not None:
+            n_err += 1
+            print(f"  !! sample {row['sample_index']} : {rec_err}", flush=True)
+            rec = {"flight": args.flight,
+                   "sample_index": int(row["sample_index"]),
+                   "dts_ticks": tick,
+                   "error": rec_err}
+        else:
+            shapes = []
+            for s in (body.get("data") or {}).get("shapes") or []:
+                sh = shape_of(s, pmap, coarse, w, h, args.uncertain_below)
+                if sh is not None:
+                    shapes.append(sh)
+            rec = {"flight": args.flight,
+                   "sample_index": int(row["sample_index"]),
+                   "dts_ticks": tick,
+                   "dts_s": float(row.get("dts_s") or 0),
+                   "utc_us": row.get("utc_us") or None,
+                   "stem": f"{args.flight}_{prefixe}_{tick * 1000 // timescale}",
+                   "width": w, "height": h,
+                   **(extra or {}),
+                   "shapes": shapes,
+                   "t_inf_s": round(t_inf, 3)}
+            n_shapes += len(shapes)
+        ecrit(rec)
+
+    idx = [0]
+    if args.stream == "thermal":
+        # Pas de décodeur : accès direct aux samples, dans l'ordre du tronçon.
+        with open(args.video, "rb") as f:
+            clamp, rayures = clamp_destripage(
+                f, [r for r in rows if r.get("valid") == "1"])
+            print(f"[i] destripage : {'oui' if clamp else 'non'} "
+                  f"(S={rayures:.1f} DN, borne {clamp:.0f} DN)", flush=True)
+            for tick in pending:
+                row = by_tick[tick]
+                brute = lit_thermique(f, row)
+                if brute.min() == brute.max():
+                    fige = int(brute[0, 0]) == THERMAL_FROZEN_DN
+                    ecrit({"flight": args.flight,
+                           "sample_index": int(row["sample_index"]),
+                           "dts_ticks": tick,
+                           "dts_s": float(row.get("dts_s") or 0),
+                           "width": THERMAL_W, "height": THERMAL_H, "shapes": [],
+                           "skipped": "frame figée" if fige else "frame constante"})
+                    continue
+                img, lo, hi = thermique_8bits(brute, clamp)
+                annote(img, row, tick, ".png",
+                       {"lo_dn": round(lo, 1), "hi_dn": round(hi, 1), "clamp_dn": round(clamp, 1)})
+        idx[0] = len(pending)
+
     # Boucle robuste : un paquet corrompu ou une transition de flux (rafales
     # IR du DefaultVideo) fait lever à PyAV une InvalidDataError FATALE pour
     # le décodeur. On ré-ouvre alors le conteneur depuis la première frame
     # non faite ; après 3 passes sans progrès sur la même frame, elle est
     # écrite en erreur et on passe à la suivante (reprise par --retry-errors).
-    idx = [0]
     while idx[0] < len(pending):
         cible = pending[idx[0]]
         progres = 0
@@ -306,77 +477,8 @@ def main():
                         continue
                     tick = int(frame.pts)  # time_base = 1/timescale => pts == dts_ticks
                     if idx[0] < len(pending) and tick == pending[idx[0]]:
-                        row = by_tick[tick]
-                        img = frame.to_ndarray(format="bgr24")
-                        h, w = img.shape[:2]
-                        ok, buf = cv2.imencode(".jpg", img,
-                                               [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_q])
-                        if not ok:
-                            rec_err = "erreur encodage jpeg"
-                        else:
-                            b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-                            t_inf = time.time()
-                            rec_err = None
-                            body = None
-                            for attempt in range(args.retries):
-                                try:
-                                    r = sess.post(
-                                        f"{args.server}/v1/predict",
-                                        json={"model": args.model,
-                                              "image": f"data:image/jpeg;base64,{b64}",
-                                              "params": params},
-                                        timeout=args.timeout)
-                                    r.raise_for_status()
-                                    body = r.json()
-                                    if body.get("error"):
-                                        rec_err = str(body)[:300]
-                                        body = None
-                                    break
-                                except Exception as e:
-                                    rec_err = str(e)[:300]
-                                    if attempt < args.retries - 1:
-                                        time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
-                            t_inf = time.time() - t_inf
-                        if rec_err is not None:
-                            n_err += 1
-                            print(f"  !! sample {row['sample_index']} : {rec_err}", flush=True)
-                            rec = {"flight": args.flight,
-                                   "sample_index": int(row["sample_index"]),
-                                   "dts_ticks": tick,
-                                   "error": rec_err}
-                        else:
-                            shapes = []
-                            for s in (body.get("data") or {}).get("shapes") or []:
-                                sh = shape_of(s, pmap, coarse, w, h, args.uncertain_below)
-                                if sh is not None:
-                                    shapes.append(sh)
-                            rec = {"flight": args.flight,
-                                   "sample_index": int(row["sample_index"]),
-                                   "dts_ticks": tick,
-                                   "dts_s": float(row.get("dts_s") or 0),
-                                   "utc_us": row.get("utc_us") or None,
-                                   "stem": f"{args.flight}_rgb_{tick * 1000 // timescale}",
-                                   "width": w, "height": h,
-                                   "shapes": shapes,
-                                   "t_inf_s": round(t_inf, 3)}
-                            n_shapes += len(shapes)
-                        n_done += 1
+                        annote(frame.to_ndarray(format="bgr24"), by_tick[tick], tick)
                         progres += 1
-                        out.write(json.dumps(rec, ensure_ascii=False).encode("utf-8") + b"\n")
-                        if n_done % 25 == 0:
-                            out.flush()
-                            os.fsync(out.fileno())
-                        now = time.time()
-                        if now - last_print > 30:
-                            el = now - t0
-                            print(f"  {n_done}/{len(pending)} | {el:.0f}s | "
-                                  f"{n_done / el:.2f} frames/s | {n_shapes} shapes | "
-                                  f"{n_err} err", flush=True)
-                            last_print = now
-                        if n_err and args.max_errors and n_err >= args.max_errors:
-                            print("[!] trop d'erreurs, abandon du tronçon",
-                                  file=sys.stderr)
-                            raise SystemExit(3)
                         idx[0] += 1
                         corrompues_consecutives = 0  # frame décodée : reset
                     if idx[0] < len(pending) and pending[idx[0]] < tick:
@@ -437,6 +539,7 @@ def main():
     tmp = done_marker.with_suffix(".done.tmp")
     tmp.write_text(
         json.dumps({"flight": args.flight, "start": args.start, "end": end,
+                    "stream": args.stream,
                     "frames": len(pending), "shapes": n_shapes, "errors": n_err,
                     "model": args.model, "prompt": args.prompt, "conf": args.conf,
                     "tile_size": args.tile_size if args.model.endswith("_tiled") else None})

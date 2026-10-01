@@ -6,12 +6,19 @@ disque. Les sorties vont en local dans `dossier_pistes(vol)`
 (`Datasets/real/AnafiUKR/pistes/<vol>/` pour 0000011, 0000012 et 0000018,
 `Datasets/real/CAMPAGNE3/pistes/<vol>/` pour les autres) ; les entrées ne sont
 jamais modifiées.
+
+PISTES_FLUX=visible (variable d'environnement) fait travailler tous ces
+scripts sur la piste VisibleVideo — le RGB 4K à 8,57 fps des rafales
+thermiques, apparié à l'IR — au lieu du DefaultVideo : détections dans
+`annots-visible/<vol>/`, index samples_visible.csv, piste vidéo 1, sorties
+dans `pistes-visible/<vol>/`.
 Voir TRACKER-PISTES.md pour les formats.
 """
 from __future__ import annotations
 
 import csv
 import json
+import os
 import queue
 import re
 import subprocess
@@ -34,6 +41,12 @@ SORTIES = Path("/home/cbarbier/Documents/Geolocalisation/Datasets/real/AnafiUKR"
 SORTIES_CAMPAGNE3 = Path("/home/cbarbier/Documents/Geolocalisation/Datasets/real"
                          "/CAMPAGNE3/pistes")
 VOLS_ANAFIUKR = {"0000011", "0000012", "0000018"}
+# Flux annoté : nom dans l'index, dossier des détections, piste vidéo du MP4.
+FLUX = os.environ.get("PISTES_FLUX", "default")
+_FLUX = {"default": ("annots", 0), "visible": ("annots-visible", 1)}
+if FLUX not in _FLUX:
+    raise SystemExit(f"[!] PISTES_FLUX={FLUX} inconnu ({', '.join(_FLUX)})")
+DOSSIER_ANNOTS, PISTE_VIDEO = _FLUX[FLUX]
 # Vols RGB de jour, seuls gardés pour le VLM (consigne du 2026-09-29) : filmés
 # entre 05h33 et 17h08. Exclus, sans rien supprimer : les 9 vols de 22h48 à
 # 00h35 (0000229-0000236, 0000429, 0000431 : nuit, surtout IR) et 0000016
@@ -59,7 +72,10 @@ class Frame:
 
 
 def dossier_pistes(vol: str) -> Path:
-    return (SORTIES if vol in VOLS_ANAFIUKR else SORTIES_CAMPAGNE3) / vol
+    base = SORTIES if vol in VOLS_ANAFIUKR else SORTIES_CAMPAGNE3
+    if FLUX != "default":
+        base = base.with_name(f"{base.name}-{FLUX}")
+    return base / vol
 
 
 def chemins_vol(vol: str, racine: Path = RACINE) -> Dict[str, Path]:
@@ -68,10 +84,10 @@ def chemins_vol(vol: str, racine: Path = RACINE) -> Dict[str, Path]:
         raise SystemExit(f"[!] {len(videos)} vidéo(s) {vol}_video.MP4 sous "
                          f"{racine / 'campagne3_index'} (une attendue)")
     return {
-        "annots": racine / "annots" / vol,
+        "annots": racine / DOSSIER_ANNOTS / vol,
         "video": videos[0],
         "index": (racine / "campagne3_index" / "annotation" / vol / "index"
-                  / "samples_default.csv"),
+                  / f"samples_{FLUX}.csv"),
         "pistes": dossier_pistes(vol),
     }
 
@@ -168,10 +184,10 @@ def dernier_jeu(dossier: Path, vol: str) -> Path:
 
 
 def ticks_index(index_csv: Path) -> Dict[int, int]:
-    """sample_index -> dts_ticks du flux DefaultVideo."""
+    """sample_index -> dts_ticks du flux annoté (FLUX)."""
     with open(index_csv, newline="", encoding="utf-8") as f:
         return {int(r["sample_index"]): int(r["dts_ticks"])
-                for r in csv.DictReader(f) if r["stream"] == "default"}
+                for r in csv.DictReader(f) if r["stream"] == FLUX}
 
 
 def timescale_index(index_csv: Path) -> int:
@@ -184,7 +200,7 @@ def telemetrie_index(index_csv: Path) -> Dict[int, dict]:
     """sample_index -> ligne de l'index (hauteur, champ de vue, assiette...)."""
     with open(index_csv, newline="", encoding="utf-8") as f:
         return {int(r["sample_index"]): r for r in csv.DictReader(f)
-                if r["stream"] == "default"}
+                if r["stream"] == FLUX}
 
 
 def largeur_sol_m(ligne: dict, bbox, largeur: int = 3840, hauteur: int = 2160,
@@ -215,7 +231,7 @@ def decode_frames(video: Path, ticks: List[int], hwaccel: bool = True,
     """Génère (position, image BGR ou None) pour chaque tick demandé, en ordre.
 
     Seek au keyframe précédent quand la prochaine frame demandée est à plus
-    de `saut_s` secondes (trous IR), décodage continu sinon. Le flux 0 a une
+    de `saut_s` secondes (trous IR), décodage continu sinon. Le flux a une
     base de temps 1/timescale et pas de B-frames : `frame.pts == dts_ticks`.
     timescale est celui du flux sauf s'il est imposé : 30000 pour la plupart
     des vols, 90000 pour 0000016 (l'index suit le flux).
@@ -231,7 +247,7 @@ def decode_frames(video: Path, ticks: List[int], hwaccel: bool = True,
         except Exception:  # PyAV sans hwaccel : décodage logiciel
             pass
     conteneur = av.open(str(video), **options)
-    flux = conteneur.streams.video[0]
+    flux = conteneur.streams.video[PISTE_VIDEO]
     if timescale is None:
         timescale = flux.time_base.denominator
     if flux.time_base.numerator != 1 or flux.time_base.denominator != timescale:

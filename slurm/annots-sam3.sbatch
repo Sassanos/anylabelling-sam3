@@ -14,8 +14,9 @@
 # Soumettre avec l'étendue d'array correspondant à tasks.json :
 #   sbatch --array=0-33 slurm/annots-sam3.sbatch
 # Les tronçons sont idempotents (marqueur .done) : resoumettre reprend ce qui
-# manque. Le port est dérivé de SLURM_ARRAY_TASK_ID (jamais de JOB_ID : toutes
-# les tâches d'un array partagent le même numéro de job).
+# manque. Le port du serveur est un port libre demandé au système : un port
+# fixe (12000 + tâche) tombait sur les serveurs vLLM d'autres utilisateurs du
+# même nœud, dont le /health répond aussi — le client leur envoyait les frames.
 #
 # Environnement : pas de venv sur ceph (quota d'inodes ~25-30k, un venv torch
 # en fait 40-60k) — une archive du venv (1 fichier) est détarrée dans /dev/shm
@@ -30,7 +31,6 @@ SCRIPT="$PROJECT_DIR/scripts/annote-video-sam3.py"
 # tasks.json par défaut ; surchargeable pour un test : sbatch --export=ANNOTS_TASKS_FILE=...
 TASKS_FILE="${ANNOTS_TASKS_FILE:-$PROJECT_DIR/slurm/tasks.json}"
 OUT_ROOT="${ANNOTS_OUT_ROOT:-$PROJECT_DIR/annots}"
-PORT=$((12000 + SLURM_ARRAY_TASK_ID))
 ENV_TAR="$PROJECT_DIR/env/annots-sam3-env-v1.tar.zst"
 SHM_ENV="/dev/shm/annots-sam3-env-v1"        # nom versionné avec l'archive
 PY="$SHM_ENV/.venv/bin/python"
@@ -67,17 +67,24 @@ fi
 echo "Tâche : vol $FLIGHT, tronçon [$START, $END)"
 
 # --- Serveur d'inférence (chargement de sam3.pt, ~3,4 Go ; attendre « Successfully loaded »)
+PORT=$("$PY" -c "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])")
+echo "Port du serveur : $PORT"
 cd "$SERVER_DIR"
 "$PY" -c "from app.cli import main; main()" --host 127.0.0.1 --port "$PORT" &
 SERVER_PID=$!
 cd - > /dev/null
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
-"$PY" - "$PORT" <<'PY'
-import sys, time
+"$PY" - "$PORT" "$SERVER_PID" <<'PY'
+import os, sys, time
 import requests
 url = f"http://127.0.0.1:{sys.argv[1]}/health"
 for _ in range(150):
+    try:
+        os.kill(int(sys.argv[2]), 0)
+    except OSError:  # port pris entre-temps, poids illisibles...
+        print("Le serveur s'est arrêté au démarrage", file=sys.stderr)
+        sys.exit(3)
     try:
         if requests.get(url, timeout=5).ok:
             print("Serveur prêt.")

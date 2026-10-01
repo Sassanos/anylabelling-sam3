@@ -55,6 +55,11 @@ VERSION_INDICES = 1
 # pureté 0,986 dans les deux cas, 1,03 -> 1,06 morceau par objet, couverture
 # 0,84 -> 0,96 en passant à 0,3 / 0,3.
 SEUILS_SAM3 = {"track_high_thresh": 0.3, "new_track_thresh": 0.3}
+# Le flux visible numérote ses frames sans trou d'une rafale thermique à la
+# suivante : c'est l'écart de temps qui y sépare les tronçons continus (1 s,
+# comme ir_gap_s de build_index). Sans effet sur le DefaultVideo, où une
+# seconde vaut au moins 8 frames.
+COUPURE_S = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +211,8 @@ def segments_continus(frames, coupure):
     for pos, f in enumerate(frames):
         if f.erreur:
             continue
-        if courant and f.sample - frames[courant[-1]].sample > coupure:
+        if courant and (f.sample - frames[courant[-1]].sample > coupure
+                        or f.t - frames[courant[-1]].t > COUPURE_S):
             segments.append(courant)
             courant = []
         courant.append(pos)
@@ -406,7 +412,7 @@ def main():
             f"p{q}": float(np.percentile(longueurs, q))
             for q in (10, 25, 50, 75, 90, 99)} | {"max": int(longueurs.max())},
         "pistes_plus_de_1s": int(sum(1 for l in lignes
-                                     if l["sample_max"] - l["sample_min"] >= 30)),
+                                     if l["t_max_s"] - l["t_min_s"] >= 1.0)),
         "duree_association_s": round(duree_assoc, 1),
     }
 
