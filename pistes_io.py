@@ -227,7 +227,8 @@ def largeur_sol_m(ligne: dict, bbox, largeur: int = 3840, hauteur: int = 2160,
 
 
 def decode_frames(video: Path, ticks: List[int], hwaccel: bool = True,
-                  saut_s: float = 4.0, timescale: Optional[int] = None):
+                  saut_s: float = 4.0, timescale: Optional[int] = None,
+                  piste: Optional[int] = None):
     """Génère (position, image BGR ou None) pour chaque tick demandé, en ordre.
 
     Seek au keyframe précédent quand la prochaine frame demandée est à plus
@@ -236,6 +237,7 @@ def decode_frames(video: Path, ticks: List[int], hwaccel: bool = True,
     timescale est celui du flux sauf s'il est imposé : 30000 pour la plupart
     des vols, 90000 pour 0000016 (l'index suit le flux).
     None signale un tick absent du flux (ne devrait pas arriver).
+    piste impose la piste vidéo (défaut : celle du flux annoté, PISTE_VIDEO).
     """
     import av
     options = {}
@@ -247,7 +249,7 @@ def decode_frames(video: Path, ticks: List[int], hwaccel: bool = True,
         except Exception:  # PyAV sans hwaccel : décodage logiciel
             pass
     conteneur = av.open(str(video), **options)
-    flux = conteneur.streams.video[PISTE_VIDEO]
+    flux = conteneur.streams.video[PISTE_VIDEO if piste is None else piste]
     if timescale is None:
         timescale = flux.time_base.denominator
     if flux.time_base.numerator != 1 or flux.time_base.denominator != timescale:

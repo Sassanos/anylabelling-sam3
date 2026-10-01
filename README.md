@@ -1282,6 +1282,27 @@ direct sur la piste thermique, tuiles 320, 13 907 frames en 7 tronçons de 2 500
 Le visible n'est annoté que sur les vols de jour : de nuit il est noir, seul le
 thermique direct a un sens.
 
+**Recalage frame par frame — `recalage-ir.py`.** Pour chaque frame thermique, la frame
+visible la plus proche (`utc_us`, 70 ms) et le décalage `(ox, oy)` en px IR, écrits dans
+`Datasets/real/AnafiUKR/ir/<vol>/<vol>_recalage.csv` (~35 frames/s, NVDEC). L'écart du
+centre IR au centre du visible suit une loi en `1/s` — `dx = 12,15 − 46,84/s`,
+`dy = −27,11 + 25,50/s` px IR — ajustée sur 3 818 frames bien corrélées des trois vols
+(résidu médian 0,6 px, 2,3 px au 90e centile, biais par vol sous 1 px) : un écart
+angulaire constant entre les axes, plus un zoom numérique du visible décentré. Le décalage
+retenu (`ox_l`, `oy_l`) est cette loi, corrigée de la médiane des résidus des frames bien
+corrélées à moins de 3 s ; elle recale donc aussi les scènes sans contour (0000018, vu
+de haut : corrélation médiane 0,03).
+
+| Vol | paires | bien corrélées (≥ 0,15) | visible couvrant toute l'image IR |
+|---|---|---|---|
+| 0000011 | 7 020 | 4 138 | 4 824 |
+| 0000012 | 967 | 887 | 236 |
+| 0000018 | 5 920 | 1 387 | 1 255 |
+
+Le visible ne couvre toute l'image thermique qu'au-dessus de ~44° de champ (32° en
+largeur, mais il est en 16:9 et le thermique en 5:4). En dessous, la partie de l'image
+IR hors du visible ne peut être annotée que par SAM 3 direct sur le thermique.
+
 ## Chiffres mesurés (RTX 4000 Ada, 12 Go)
 
 Crête VRAM de propagation SAM 3.1 ~= `4,2 + 0,65 x detector_batch_size` Go.
